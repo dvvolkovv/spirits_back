@@ -13,8 +13,9 @@ jest.mock('../../common/telegram-alert', () => ({
 /**
  * Память загрузок в текущем чате (spec 2026-11-13-chat-upload-memory, Task 6).
  *
- * Каждый текстовый ход — обычный resume, холодный старт и «чистый лист» —
- * везёт в теле реплики к релею последние загрузки сессии (до 10): имя и
+ * Каждый текстовый ход — обычный resume, холодный старт и ход после точки
+ * «Чистого листа» (тогда — только загрузки после точки) — везёт в теле
+ * реплики к релею последние загрузки сессии (до 10): имя и
  * короткоживущую подписанную ссылку. При ротации релей вырезает блок
  * `User uploaded files` из переносимого хвоста, и до этой правки память о
  * файле терялась; теперь она восстанавливается из реестра chat_uploads.
@@ -24,8 +25,8 @@ jest.mock('../../common/telegram-alert', () => ({
  * чеканится заново каждый ход — там она сломала бы кэш промпта и утекла бы
  * в долгоживущие поверхности.
  *
- * Запрос к реестру идёт по СЫРОМУ ключу сессии Postgres (freshSessionId или
- * `<userId>_<assistantId>`) — тому же, что у custom_chat_history и
+ * Запрос к реестру идёт по СЫРОМУ ключу сессии Postgres (freshSessionId пинга
+ * или `<userId>_<assistantId>`) — тому же, что у custom_chat_history и
  * chat_uploads, а не по ключу релея с языковым суффиксом.
  */
 
@@ -136,7 +137,7 @@ function makeSvc(uploads?: ChatUploadsService): { svc: ChatService; pg: { query:
 async function run(
   svc: ChatService,
   message: string,
-  opts: { fresh?: boolean; history?: { type: string; content: string }[]; probe?: boolean } = {},
+  opts: { resetAt?: Date; history?: { type: string; content: string }[]; probe?: boolean } = {},
 ): Promise<Record<string, string>> {
   const post = axios.post as jest.Mock;
   post.mockClear();
@@ -154,11 +155,13 @@ async function run(
     opts.history ?? [], '', res,
     'Роман', '', '',
     undefined,
-    !!opts.fresh,
-    opts.fresh ? 'u-test_12_fresh_1' : undefined,
+    // fresh, freshSessionId — изолированная сессия только у пингов, здесь не нужна
+    false, undefined,
     // requestLang, clientTz, balanceBlock, agentCategory
     undefined, undefined, undefined, undefined,
     !!opts.probe,
+    // ui, storeBuild, точка «Чистого листа»
+    undefined, false, opts.resetAt ?? null,
   );
   for (let i = 0; i < 30; i++) await new Promise((r) => setImmediate(r));
   expect(post).toHaveBeenCalled();
@@ -213,14 +216,29 @@ describe('streamUniversalAgent: память последних загрузок
     expect(fields.history).not.toContain('Earlier user uploads');
   });
 
-  it('чистый лист: блок есть, реестр опрошен по fresh-сессии', async () => {
-    const { uploads, recentSpy } = makeUploads();
+  it('после точки «Чистого листа»: реестр опрошен по основной ленте, файлы до точки отсечены', async () => {
+    // Лента одна (spec 2026-11-17-context-reset): отдельной fresh-сессии нет,
+    // файлы до точки ассистенту не напоминаем.
+    const before: ChatUploadRecord = {
+      ...RECORD,
+      id: '22222222-2222-4222-8222-222222222222',
+      originalName: 'old.pdf',
+      createdAt: '2026-11-10T00:00:00.000Z',
+    };
+    const after: ChatUploadRecord = { ...RECORD, createdAt: '2026-11-13T00:00:00.000Z' };
+    const resetAt = new Date('2026-11-12T00:00:00.000Z');
+    const { uploads, recentSpy } = makeUploads([after, before]);
     const { svc } = makeSvc(uploads);
-    const fields = await run(svc, 'новая тема — что было в файле?', { fresh: true });
+    const fields = await run(svc, 'новая тема — что было в файле?', { resetAt });
 
+    expect(recentSpy).toHaveBeenCalledWith('u-test', 'u-test_12', []);
     expect(fields.message).toContain('Earlier user uploads');
     expect(fields.message).toContain('a.pdf');
-    expect(recentSpy).toHaveBeenCalledWith('u-test', 'u-test_12_fresh_1', []);
+    expect(fields.message).not.toContain('old.pdf');
+    expect(fields.message).not.toContain(before.id);
+    // Ключ релея — с точкой. Строки профиля в этом харнесе нет — consent
+    // закрыт, отсюда суффикс запрета профилирования после точки.
+    expect(fields.sessionId).toBe(`u-test_12_ru_r${resetAt.getTime()}_noprofiling`);
   });
 
   it('флаг выключен — блока нет нигде, реестр не опрашивается', async () => {

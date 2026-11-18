@@ -16,16 +16,14 @@ export class ActionPlansController {
 
   @Post('generate')
   generate(@CurrentUser() user: any, @Body() body: any) {
-    return this.plans.generate(
-      user.userId,
-      assistantIdOf(body?.assistantId),
-      typeof body?.freshTs === 'string' ? body.freshTs : undefined,
-    );
+    // Лента одна (spec 2026-11-17-context-reset): freshTs старых клиентов не
+    // читаем — план по основной ленте, после точки «Чистого листа».
+    return this.plans.generate(user.userId, assistantIdOf(body?.assistantId));
   }
 
   @Get()
-  async find(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('freshTs') freshTs?: string) {
-    const plan = await this.plans.findForConversation(user.userId, assistantIdOf(assistantId), freshTs);
+  async find(@CurrentUser() user: any, @Query('assistantId') assistantId: string) {
+    const plan = await this.plans.findForConversation(user.userId, assistantIdOf(assistantId));
     return { plan };
   }
 

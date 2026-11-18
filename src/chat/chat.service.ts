@@ -37,6 +37,8 @@ import { resultRules } from './result-rules';
 import { chatFailureText } from './chat-failure-texts';
 import { BillingDecision, TurnDelivery, billingDecision } from './partial-billing';
 import { relaySessionKey } from './relay-session';
+import { afterReset } from './context-reset/after-reset';
+import { ChatContextResetService } from './context-reset/context-reset.service';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
@@ -484,13 +486,19 @@ export class ChatService {
    * моменту не перехватил настоящий новый ход (самоисцеление — ниже, в
    * streamUniversalAgent).
    *
-   * activeTurns занят весь ход, включая копирование файлов и персист ПОСЛЕ
-   * ответа (до ~60 с) — релея там уже нет, убивать нечего. relayRunning занят
-   * только пока длится сам запрос к релею: открывается вокруг callUpstreamOnce
+   * activeTurns занят дольше: весь ход до ответа клиенту, включая
+   * копирование файлов после ответа релея (flushFileLinks, до ~60 с) — релея
+   * там уже нет, убивать нечего. Запись ответа в историю метку не держит ни
+   * в одном пути: у релея (и у Маши) метка снимается в finally, когда
+   * persistResponse (saveChatHistory) лишь поставлен в setImmediate; ход с
+   * вложениями (ChatController.uploadAndChat) снимает её сразу после
+   * res.end, до persistUploadTurn. relayRunning занят только пока длится сам
+   * запрос к релею: открывается вокруг callUpstreamOnce
    * (и self-heal повтора), закрывается в finally ДО копирования. Ключ — сам
-   * relaySid, а не userId_assistantId: у «чистого листа» и у обычного хода
-   * той же пары разные relaySid (freshSessionId входит в ключ), и прерывание
-   * одного не задевает другой (находки ревью Б2 Step 6).
+   * relaySid, а не userId_assistantId: изолированная сессия пинга и точка
+   * «Чистого листа» входят в ключ (relay-session.ts), так что у пинга и
+   * обычного хода той же пары, как и у ходов до и после точки, relaySid
+   * разные, и прерывание одного не задевает другой (находки ревью Б2 Step 6).
    *
    * Фоновые ходы. agentReply (рутины, «Путь», план действий, итоги звонков,
    * проба качества) пишет в ТУ ЖЕ сессию релея, что и обычный чат. С 05.11
@@ -738,8 +746,12 @@ export class ChatService {
     return best ? best.id : null;
   }
 
-  private dupKey(userId: string, assistantId: string, message: string): string {
-    return `${userId}::${assistantId}::${(message || '').trim().slice(0, 300)}`;
+  // Точка «Чистого листа» — часть ключа: человек нажал «Чистый лист» и в
+  // пределах окна дедупа повторил тот же вопрос, чтобы спросить заново без
+  // старого контекста. Без точки в ключе он получил бы «уже ответил выше», а
+  // тот ответ — над чертой, из прошлого разговора.
+  private dupKey(userId: string, assistantId: string, message: string, resetAt?: Date | null): string {
+    return `${userId}::${assistantId}::${resetAt?.getTime() ?? ''}::${(message || '').trim().slice(0, 300)}`;
   }
 
   constructor(
@@ -791,6 +803,10 @@ export class ChatService {
     // идут как до фичи. Тип — класс ChatUploadsService (сторож design:paramtypes
     // — chat-uploads/chat-uploads.prompt.spec.ts).
     @Optional() private readonly chatUploads?: ChatUploadsService,
+    // Точка «Чистого листа» (spec 2026-11-17-context-reset). Последним и
+    // @Optional: спеки собирают сервис позиционно; без него точки нет.
+    // Тип — класс (сторож design:paramtypes — chat.service.context-reset.spec.ts).
+    @Optional() private readonly contextResets?: ChatContextResetService,
   ) {}
 
   /**
@@ -1199,7 +1215,7 @@ export class ChatService {
    * ClaudeCliService склеивает system с репликой в одно тело `-p`.
    *
    * rawSessionId — сырой ключ сессии Postgres (custom_chat_history,
-   * chat_uploads): freshSessionId или `${userId}_${assistantId}`, БЕЗ
+   * chat_uploads): freshSessionId пинга или `${userId}_${assistantId}`, БЕЗ
    * языкового суффикса ключа релея.
    *
    * Флаг CHAT_UPLOADS_ENABLED выключен или реестра нет — пустая строка; сбой
@@ -1212,16 +1228,31 @@ export class ChatService {
   private async uploadContextBlock(
     userId: string,
     rawSessionId: string,
-    excludeIds?: string[],
+    // Файлы этого хода (уже в промпте путями на релее); нечего исключать —
+    // undefined явно: параметр обязателен позиционно, раз за ним идёт точка.
+    excludeIds: string[] | undefined,
+    // Точка «Чистого листа»: файлы до неё ассистенту не напоминаем. Нет точки
+    // (или пинг) — null явно. Обязательный: с необязательным вызов без точки
+    // молча компилировался — так ветка Маши из main возвращала файлы до
+    // точки. Теперь такой вызов ловит tsc.
+    since: Date | null,
   ): Promise<string> {
     if (!this.chatUploads || process.env.CHAT_UPLOADS_ENABLED !== 'true') return '';
     try {
       const records = await this.chatUploads.recentForSession(userId, rawSessionId, excludeIds || []);
-      return this.chatUploads.assistantBlock(records);
+      return this.chatUploads.assistantBlock(afterReset(records, since, (r) => r.createdAt));
     } catch (e: any) {
       this.logger.warn(`upload context failed: ${errKind(e)}`);
       return '';
     }
+  }
+
+  /**
+   * Точка «Чистого листа» пары. Сбой чтения не роняет ход: ассистент ответит
+   * с прежней памятью — хуже, чем с чистой, но лучше, чем никак.
+   */
+  private contextResetAt(userId: string, assistantId: string): Promise<Date | null> {
+    return ChatContextResetService.getOrNull(this.contextResets, userId, String(assistantId), (m) => this.logger.warn(m));
   }
 
   /**
@@ -1235,7 +1266,6 @@ export class ChatService {
     userId: string;
     assistantId: string;
     profileText?: string;
-    freshSessionId?: string;
     /**
      * ID исходников, сохранённых ЭТИМ ходом (контроллер сохраняет их до
      * сборки handoff). В блок памяти не включаются: файлы текущего хода уже
@@ -1254,10 +1284,14 @@ export class ChatService {
     storeBuild?: boolean;
     ui?: ClientUi;
   }): Promise<UploadHandoff> {
-    const { userId, assistantId, freshSessionId } = p;
+    // Изолированной fresh-сессии у загрузок нет (spec 2026-11-17-context-reset):
+    // она осталась только у пингов мониторинга, а пинги файлов не шлют.
+    // «Чистый лист» здесь — точка, та же, что у текстового хода.
+    const { userId, assistantId } = p;
     const profileText = p.profileText || '';
     const userLanguage = await this.language.resolveUserLanguage(userId, p.requestLang);
-    const baseSessionId = relaySessionKey(userId, assistantId, userLanguage, freshSessionId);
+    const resetAt = await this.contextResetAt(userId, assistantId);
+    const baseSessionId = relaySessionKey(userId, assistantId, userLanguage, undefined, resetAt);
     const profilingBlocks: RelayProfilingBlocks = {};
 
     // Персона — best-effort: не нашли ассистента, отвалилась БД — ход с файлом
@@ -1290,13 +1324,14 @@ export class ChatService {
     let history = '';
     try {
       const histRes = await this.pg.query(
-        `SELECT sender_type, content FROM custom_chat_history
+        `SELECT sender_type, content, created_at FROM custom_chat_history
          WHERE session_id = $1
          ORDER BY created_at DESC LIMIT 10`,
-        [freshSessionId || `${userId}_${assistantId}`],
+        [`${userId}_${assistantId}`],
       );
+      // Хвост — только после точки, тем же фильтром, что у текстового хода.
       history = this.renderHistoryBlock(
-        histRes.rows.reverse().map((r: any) => ({
+        afterReset(histRes.rows, resetAt, (r: any) => r.created_at).reverse().map((r: any) => ({
           type: r.sender_type === 'human' ? 'user' : 'assistant',
           content: r.content,
         })),
@@ -1309,8 +1344,9 @@ export class ChatService {
     // Файлы текущего хода (savedUploadIds) исключены: они уже в multipart-промпте.
     const uploadContext = await this.uploadContextBlock(
       userId,
-      freshSessionId || `${userId}_${assistantId}`,
+      `${userId}_${assistantId}`,
       p.savedUploadIds,
+      resetAt,
     );
 
     // Даже пустой новый systemPrompt не стирает профиль из resumed-сессии.
@@ -1355,9 +1391,12 @@ export class ChatService {
     profileText: string,
     res: Response,
     req?: Request,
-    // «Чистый лист»: история и запись идут в отдельную fresh-сессию (sessionId),
-    // прошлые задачи в промпт не инжектятся. Профиль ЧИТАЕТСЯ (вариант A) и
-    // ФОРМИРУЕТСЯ (consolidateFromChat работает от переданных сообщений).
+    // Изолированная fresh-сессия: история и запись идут в отдельную сессию
+    // (sessionId), прошлые задачи в промпт не инжектятся. Профиль ЧИТАЕТСЯ
+    // (вариант A) и ФОРМИРУЕТСЯ (consolidateFromChat работает от переданных
+    // сообщений). «Чистый лист» живого человека — уже не это, а точка отсчёта
+    // (contextResets, spec 2026-11-17-context-reset); изолированный путь
+    // остаётся для пингов мониторинга.
     fresh: boolean = false,
     // Язык интерфейса из тела запроса — подсказка на случай пустого профиля.
     // Профиль остаётся главным, приоритет разбирает resolveUserLanguage.
@@ -1377,6 +1416,13 @@ export class ChatService {
     // Не прислал — не умеет: мобилка и старый веб получают ход как раньше.
     ui: ClientUi = NO_CLIENT_UI,
   ): Promise<void> {
+    // Момент хода — для задач, извлечённых из него в фоне: created_at задачи =
+    // момент разговора, а не фоновой вставки. Иначе точка «Чистого листа»,
+    // нажатая сразу после ответа, оказалась бы раньше задачи из старого
+    // разговора и пропустила бы её за черту. Берём до любых await. Часы Node
+    // против часов базы (точка ставится по now() базы) — перекос в секунды
+    // безопасен, см. спеку 2026-11-17-context-reset, «Риски».
+    const turnAt = new Date();
     // Get agent
     const agent = await this.resolveAgent(userId, assistantId);
     if (!agent) {
@@ -1386,6 +1432,9 @@ export class ChatService {
     // Get chat history (individual rows: session_id, sender_type, content)
     // fresh: история и запись — в отдельной fresh-сессии из controller'а.
     const chatSessionId = fresh ? sessionId : `${userId}_${assistantId}`;
+    // Точка «Чистого листа»: ассистент помнит только то, что после неё. У пинга
+    // мониторинга (fresh) своя изолированная сессия — точка ему не нужна.
+    const resetAt = fresh ? null : await this.contextResetAt(userId, String(assistantId));
 
     // Ссылка на комнату Linkeon замыкает ход: показываем карточку «Зайти во
     // встречу» и в модель не идём. Иначе за каждую вставленную ссылку платим
@@ -1479,15 +1528,20 @@ export class ChatService {
       }
     }
     const histRes = await this.pg.query(
-      `SELECT sender_type, content FROM custom_chat_history
+      `SELECT sender_type, content, created_at FROM custom_chat_history
        WHERE session_id = $1
        ORDER BY created_at DESC LIMIT 10`,
       [chatSessionId],
     );
-    const recentHistory = histRes.rows.reverse().map(r => ({
-      type: r.sender_type === 'human' ? 'user' : 'assistant',
-      content: r.content,
-    }));
+    // Хвост — только после точки. Лента одна, точка не прерывает её: до точки
+    // строки остаются в кабинете, но в память модели не идут. Фильтр — в JS
+    // (afterReset): почему не в SQL, см. after-reset.ts.
+    const recentHistory = afterReset(histRes.rows, resetAt, (r: any) => r.created_at)
+      .reverse()
+      .map((r: any) => ({
+        type: r.sender_type === 'human' ? 'user' : 'assistant',
+        content: r.content,
+      }));
 
     // Автоприветствие вкладки, открытой до 13.11 (тикет 8cf1c5ae, см.
     // legacy-greeting.ts): отвечаем сами — без модели, без списания и без
@@ -1564,7 +1618,7 @@ export class ChatService {
         recentHistory, profileText, res,
         agent.name, agent.description || '', agent.system_prompt || '',
         req, fresh, chatSessionId, requestLang, clientTz, balanceBlock,
-        agent.category, probe, ui, storeBuild,
+        agent.category, probe, ui, storeBuild, resetAt, turnAt,
       );
     }
 
@@ -1630,10 +1684,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }
     }
     // Cross-agent active tasks (см. TasksService.buildContextForPrompt).
-    // fresh: чистый лист — прошлые задачи в промпт не тянем.
+    // fresh (пинг): прошлые задачи в промпт не тянем. После точки «Чистого
+    // листа» — только задачи, созданные после неё.
     if (this.tasksService && !fresh) {
       try {
-        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message);
+        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message, { since: resetAt });
         if (tasksCtx) volatileSystemPrompt += `\n\n${tasksCtx}`;
       } catch (e: any) {
         this.logger.warn(`tasks context injection failed (Маша): ${e?.message}`);
@@ -1706,11 +1761,18 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const uploadNotesOn = process.env.CHAT_UPLOADS_ENABLED === 'true';
     // Память загрузок — тот же блок, что получают ассистенты релея
     // (uploadContextBlock): id, имя, вид, дата, комментарий и подписанная
-    // ссылка. Ключ — сырой ключ сессии Postgres этого хода (chatSessionId:
-    // `<userId>_3` или fresh-сессия «Чистого листа»). Пинги мониторинга блок
-    // не везут — как на пути релея. Флаг, отсутствие реестра и сбой БД
-    // разбирает сам uploadContextBlock: во всех трёх случаях пустая строка.
-    const mashaUploadContext = probe ? '' : await this.uploadContextBlock(userId, chatSessionId);
+    // ссылка. Ключ — сырой ключ сессии Postgres этого хода (chatSessionId):
+    // у живого человека это основная лента `<userId>_3`, и файлы до точки
+    // «Чистого листа» отсекает точка (resetAt) — тем же фильтром, что хвост
+    // переписки выше и путь релея (spec 2026-11-17-context-reset). Без точки
+    // память загрузок вернула бы ассистенту старые файлы после «Чистого
+    // листа». Изолированная fresh-сессия осталась только у пингов, а пинги
+    // мониторинга блок не везут — как на пути релея. Флаг, отсутствие реестра
+    // и сбой БД разбирает сам uploadContextBlock: во всех трёх случаях пустая
+    // строка.
+    const mashaUploadContext = probe
+      ? ''
+      : await this.uploadContextBlock(userId, chatSessionId, undefined, resetAt);
 
     // Ход в полёте — тот же учёт, что у пути релея: deploy.sh перед рестартом
     // ждёт /chat/active-streams до нуля, фронт спрашивает /chat/active-turn.
@@ -1890,15 +1952,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
             masha,
             { balance: () => this.getTokenBalance(userId) },
           );
-          // Extract profile entities from conversation — работает и в fresh-режиме:
-          // «чистый лист» не тянет прошлый контекст, но профиль формирует.
+          // Extract profile entities from conversation — всегда, и у пинга (fresh)
+          // тоже. Ход после точки «Чистого листа» — обычный разговор: профиль,
+          // задачи и бизнес-карточка из него извлекаются как обычно.
           if (this.neo4j) {
             await this.neo4j.consolidateFromChat(userId, String(assistantId), message, fullText);
           }
-          // Operational task memory (cross-agent). В fresh-режиме выключено:
-          // чистый лист не должен порождать боковых задач.
+          // Operational task memory (cross-agent). В fresh-режиме (пинг)
+          // выключено: проверка живости не должна порождать боковых задач.
+          // turnAt — момент хода, а не этой фоновой записи (см. начало streamChat).
           if (this.tasksService && !fresh) {
-            try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText); } catch {}
+            try { await this.tasksService.extractFromTurn(userId, String(assistantId), message, fullText, turnAt); } catch {}
           }
           // Бизнес-карточка наполняется тем же поводом, что и задачи, но своим
           // вызовом: у извлечения задач нет тестов, и подселять к нему вторую
@@ -2005,12 +2069,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     ui: ClientUi = NO_CLIENT_UI,
     // Сборка из стора — для справки и карты (см. streamChat, client-kind.ts).
     storeBuild: boolean = false,
+    // Точка «Чистого листа» — собрана в streamChat (spec 2026-11-17-context-reset).
+    resetAt: Date | null = null,
+    // Момент хода — для created_at задач, извлечённых из него в фоне (см. streamChat).
+    turnAt: Date = new Date(),
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
     // Идемпотентность: если идентичный запрос уже «в полёте» или только что
-    // завершился — не гоняем агента и не списываем токены второй раз.
-    const dkey = this.dupKey(userId, assistantId, message);
+    // завершился — не гоняем агента и не списываем токены второй раз. Повтор
+    // после новой точки «Чистого листа» — не дубль (см. dupKey).
+    const dkey = this.dupKey(userId, assistantId, message, resetAt);
     {
       const nowTs = Date.now();
       const ex = this.inflight.get(dkey);
@@ -2127,7 +2196,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const rawSessionId = fresh && freshSessionId
         ? freshSessionId
         : `${userId}_${assistantId}`;
-      uploadContext = await this.uploadContextBlock(userId, rawSessionId);
+      uploadContext = await this.uploadContextBlock(userId, rawSessionId, undefined, resetAt);
     }
 
     // Текущее время ГЛАЗАМИ ПОЛЬЗОВАТЕЛЯ. Без этого модель считает время по UTC
@@ -2171,10 +2240,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     // Активные задачи пользователя (cross-agent) — топ-5 по релевантности
     // к текущей реплике. Юзер видит ассистентов как продолжающих контекст
-    // незаконченных дел, а не отвечающих с нуля. fresh: чистый лист — не тянем.
+    // незаконченных дел, а не отвечающих с нуля. fresh (пинг) — не тянем;
+    // после точки «Чистого листа» — только задачи, созданные после неё.
     if (this.tasksService && !fresh) {
       try {
-        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message);
+        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message, { since: resetAt });
         if (tasksCtx) contextPrefix += tasksCtx + '\n';
       } catch (e: any) {
         this.logger.warn(`tasks context injection failed: ${e?.message}`);
@@ -2197,8 +2267,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // регистрации. Redis при недоступности висит — ждём не дольше
     // GUEST_CARRY_READ_TIMEOUT_MS, это горячий путь КАЖДОГО хода, не только
     // гостевых.
+    //
+    // Приписка гостевой пробы старше любой точки «Чистого листа» (проба — до
+    // входа) — после точки её не тянем и не стираем.
     let guestCarryConsumed = false;
-    if (this.redis && !fresh && !probe) {
+    if (this.redis && !fresh && !probe && !resetAt) {
       const carry = await withTimeout(
         peekGuestCarry(this.redis, userId, assistantId),
         GUEST_CARRY_READ_TIMEOUT_MS,
@@ -2218,10 +2291,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // 309k символов из 813k в замеренной сессии.
     const historyBlock = this.renderHistoryBlock(recentHistory);
 
-    // Базовый ключ — чистая функция от userId/assistantId/userLanguage/fresh.
+    // Базовый ключ — чистая функция от userId/assistantId/userLanguage/fresh и
+    // точки «Чистого листа» (новая точка — новая Claude-сессия без старой памяти).
     // Отдельный no-profiling ключ не даёт возобновить контекст, где профиль уже
     // был; при повторном разрешении исходная сессия остаётся доступной.
-    const baseRelaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+    const baseRelaySid = relaySessionKey(
+      userId, assistantId, userLanguage, fresh ? freshSessionId : undefined, resetAt,
+    );
     let relaySid = relaySessionForProfiling(
       baseRelaySid,
       await automaticProfilingAllowed(this.pg, userId),
@@ -2235,8 +2311,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // остаётся занятым всё время копирования файлов и персиста ПОСЛЕ того,
     // как релей уже прислал `done` и его процесс закончился — иначе человек
     // получал бы «тот ход прерван» про ход, который на самом деле уже
-    // доставлен (до ~60 с на копию). Чистый лист и обычный ход одной пары —
-    // РАЗНЫЕ relaySid (freshSessionId входит в ключ), поэтому отдельная
+    // доставлен (до ~60 с на копию). Изолированная сессия пинга и обычный ход
+    // одной пары, как и ходы до и после точки «Чистого листа», — РАЗНЫЕ
+    // relaySid (freshSessionId и точка входят в ключ), поэтому отдельная
     // проверка !fresh не нужна — эту роль уже играет сравнение по relaySid;
     // старая проверка по activeTurns + !fresh путала оба случая (находки
     // ревью Б2 Step 6: копия файлов, чистый лист, разные языковые сессии).
@@ -2599,14 +2676,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Ход, не дождавшийся релея (failureStub), разговором не был: в
           // fullText разве что хвост карточки — учить по нему нечему.
           const learn = !failureStub;
-          // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
-          // но не отключает обучение профиля).
+          // Профиль формируется всегда, и у пинга (fresh) тоже. Ход после точки
+          // «Чистого листа» — обычный разговор: точка скрывает от ассистента
+          // старый контекст, но не выключает обучение профиля и разбор задач.
           if (this.neo4j && learn) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
           }
-          // Задачи из fresh-разговора не извлекаем — чистый лист без побочных задач.
+          // Задачи из fresh-разговора (пинг) не извлекаем — без побочных задач.
+          // turnAt — момент хода, а не этой записи после ответа: см. streamChat.
           if (this.tasksService && !fresh && learn) {
-            try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText); } catch {}
+            try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText, turnAt); } catch {}
           }
           if (this.businessProfile && !fresh && learn) {
             try { await this.businessProfile.extractFromTurn(userId, assistantId, message, fullText); } catch {}
@@ -2694,10 +2773,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // представляться Claude.
           if (attempt.systemPrompt) fd.append('systemPrompt', attempt.systemPrompt);
           if (historyBlock) fd.append('history', historyBlock);
-          // fresh: relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
-          // Claude-сессию — обычный id протаскивал прошлый контекст (задачи,
-          // разговоры) в «чистый лист» мимо наших блокировок. Fresh-сессия
-          // получает на relay собственную чистую память.
+          // relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
+          // Claude-сессию — прежний id протащил бы прошлый разговор мимо любых
+          // наших фильтров. Поэтому чистую память после точки «Чистого листа»
+          // даёт метка точки в ключе релея (relay-session.ts), а у пинга
+          // мониторинга (fresh) — своя одноразовая сессия.
           // Язык — часть ключа сессии.
           //
           // Релей резюмит Claude-сессию по sessionId и тащит в неё весь прежний
@@ -3539,11 +3619,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // каждый раз оплачивать весь контекст заново, без кэша.
     const route = await resolveAnswerProvider(false, userId, this.llmProvider);
 
-    // Consent проверяется один раз перед отправкой: consent и ключ выбираются
-    // уже после resolveAnswerProvider, чтобы отзыв во время маршрутизации не
-    // ушёл на релей. Пока ход ждёт релей за шлагбаумом выката (до ~149 с),
-    // подготовленный префикс уходит повторно как есть — так же, как в ходе
-    // человека.
+    // Рутины и «Путь» продолжают ту же сессию релея, что и чат — значит, и
+    // точку «Чистого листа» уважают ту же. Изолированные пробы (override) — без
+    // неё. Читаем ДО consent ниже: тот обязан остаться последним await перед
+    // multipart.
+    const resetAt = sessionIdOverride ? null : await this.contextResetAt(userId, assistantId);
+
+    // Consent проверяется один раз перед отправкой — последним await перед
+    // multipart: consent и ключ выбираются уже после resolveAnswerProvider,
+    // чтобы отзыв во время маршрутизации не ушёл на релей. Пока ход ждёт релей
+    // за шлагбаумом выката (до ~149 с), подготовленный префикс уходит
+    // повторно как есть — так же, как в ходе человека.
     // Изолированная проба без контекста не читает profile_data по её контракту.
     const dispatchProfilingAllowed = opts.testMode === true && opts.includeUserContext === false
       ? true
@@ -3556,7 +3642,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
     // Язык в ключе сессии — по той же причине, что в основном пути: релей
     // резюмит прежний разговор, и накопленный русский перевешивает промпт.
-    const baseRelaySid = sessionIdOverride || relaySessionKey(userId, assistantId, userLanguage);
+    const baseRelaySid = sessionIdOverride || relaySessionKey(userId, assistantId, userLanguage, undefined, resetAt);
     const relaySid = relaySessionForProfiling(baseRelaySid, dispatchProfilingAllowed);
 
     const outboundPrompt = opts.testMode === true ? neutralizeAtMentions(prompt) : prompt;
@@ -3719,14 +3805,22 @@ ${LanguageService.buildDirective(userLanguage)}`;
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
-  async consolidateAfterChatPublic(userId: string, agentId: string, userMessage: string, assistantResponse: string): Promise<void> {
+  async consolidateAfterChatPublic(
+    userId: string,
+    agentId: string,
+    userMessage: string,
+    assistantResponse: string,
+    // Момент хода — created_at задач, извлечённых из него (см. streamChat).
+    // Не передан — TasksService возьмёт момент вставки, как до точки «Чистого листа».
+    turnAt?: Date,
+  ): Promise<void> {
     if (this.neo4j) {
       try { await this.neo4j.consolidateFromChat(userId, agentId, userMessage, assistantResponse); } catch (e: any) {
         this.logger.warn(`consolidateAfterChatPublic neo4j failed: ${e?.message}`);
       }
     }
     if (this.tasksService) {
-      try { await this.tasksService.extractFromTurn(userId, agentId, userMessage, assistantResponse); } catch {}
+      try { await this.tasksService.extractFromTurn(userId, agentId, userMessage, assistantResponse, turnAt); } catch {}
     }
     if (this.businessProfile) {
       try { await this.businessProfile.extractFromTurn(userId, agentId, userMessage, assistantResponse); } catch {}
@@ -4120,9 +4214,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
     modelText?: string;
     /** Файлы хода, ушедшие человеку (outputFiles релея). */
     files?: number;
-    // «Чистый лист»: ход с файлом обязан лечь в ту же историю, что и текстовый,
-    // иначе в fresh-чате его видно не будет, а всплывёт он в основном.
-    sessionIdOverride?: string;
     /** Язык и сборка — для текста сбоя CLI на языке человека. */
     userLanguage?: string;
     storeBuild?: boolean;
@@ -4134,7 +4225,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     userOnly?: boolean;
   }): Promise<number> {
     if (p.userOnly) {
-      await this.saveUserMessageRow(p.userId, p.assistantId, p.userMsg, p.sessionIdOverride);
+      await this.saveUserMessageRow(p.userId, p.assistantId, p.userMsg);
       return 0;
     }
     let text = p.assistantMsg;
@@ -4178,7 +4269,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     await this.alertExpensiveTurn(p.userId, p.assistantId, charge, textCost);
 
-    await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost, p.sessionIdOverride);
+    // Лента одна и с «Чистым листом» (spec 2026-11-17-context-reset): ход с
+    // файлом — всегда в `${userId}_${assistantId}`.
+    await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost);
     // Оборванный ход с нулевым расходом (одни файлы, а в done ни usage, ни
     // стоимости) строку не пишет: планировщик (TokenAccountingService) поднял
     // бы 0 до минимума в 1 токен, а индикатор и история показали 0. Обычный
@@ -4205,8 +4298,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     return textCost;
   }
 
-  async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0, sessionIdOverride?: string): Promise<{ messages: any[]; hasMore: boolean }> {
-    const sessionId = sessionIdOverride || `${userId}_${assistantId}`;
+  // Лента одна (spec 2026-11-17-context-reset): история — всегда основной
+  // сессии `<userId>_<assistantId>`. Fresh-сессии этот метод не читает: новые
+  // пишут только пинги мониторинга (probe), старые листы людей переносит в
+  // основную ленту разовый SQL (задача 10).
+  async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0): Promise<{ messages: any[]; hasMore: boolean }> {
+    const sessionId = `${userId}_${assistantId}`;
     const res = await this.pg.query(
       `SELECT id, sender_type, content, created_at, tokens_used FROM custom_chat_history
        WHERE session_id = $1

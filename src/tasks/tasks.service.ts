@@ -5,6 +5,7 @@ import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { shouldSkipTaskExtraction } from './extract-prefilter';
+import { afterReset } from '../chat/context-reset/after-reset';
 
 function cosineSim(a: number[], b: number[]): number {
   if (!a || !b || a.length !== b.length) return 0;
@@ -82,12 +83,18 @@ export class TasksService implements OnModuleInit {
    *   - ничего — реплика про задачу не была
    *
    * Цена: ~$0.001/turn. Не блокирует ответ юзеру (всё в setImmediate).
+   *
+   * turnAt — момент хода, из которого может родиться задача. Он становится
+   * created_at новой задачи: извлечение идёт в фоне, до вставки проходят
+   * секунды–десятки секунд, и задача из разговора до точки «Чистого листа»
+   * с created_at = now() вставки всплыла бы после точки. Без turnAt — now().
    */
   async extractFromTurn(
     userId: string,
     agentId: string,
     userMessage: string,
     assistantMessage: string,
+    turnAt?: Date | null,
   ): Promise<void> {
     if (!this.pg) return;
     if (shouldSkipTaskExtraction(userMessage)) return;
@@ -107,7 +114,7 @@ export class TasksService implements OnModuleInit {
       // Между гейтами асинхронный LLM-вызов: аккаунт могли удалить, пока
       // шло решение — повторная проверка до записи (applyDecision).
       if (!(await this.isAccountActive(userId))) return;
-      await this.applyDecision(userId, parseInt(agentId, 10) || null, decision);
+      await this.applyDecision(userId, parseInt(agentId, 10) || null, decision, turnAt);
     } catch (e: any) {
       this.logger.warn(`extractFromTurn failed for ${userId}/${agentId}: ${e?.message}`);
     }
@@ -174,9 +181,19 @@ export class TasksService implements OnModuleInit {
    *      similarity ≥ ARCHIVE_RECALL_THRESHOLD к текущей реплике. Это и есть
    *      авто-recall старых проектов («помнишь, год назад мы делали X?»).
    *
-   * Если задач нет вовсе — пустая строка, ничего не инжектится.
+   * Если задач нет вовсе или после точки since нет задач, созданных позже
+   * неё, — пустая строка, ничего не инжектится.
+   *
+   * Отсечка по created_at, а не по last_active_at: старую задачу, тронутую
+   * после точки, показывать нельзя — её summary из старого разговора.
    */
-  async buildContextForPrompt(userId: string, userMessage: string = ''): Promise<string> {
+  async buildContextForPrompt(
+    userId: string,
+    userMessage: string = '',
+    // Точка «Чистого листа» (spec 2026-11-17-context-reset): задачи общие для
+    // всех ассистентов, поэтому отсечка — по времени создания, а не по ассистенту.
+    opts: { since?: Date | null } = {},
+  ): Promise<string> {
     if (!this.pg) return '';
 
     const TOP_ACTIVE = 5;
@@ -193,32 +210,41 @@ export class TasksService implements OnModuleInit {
       archived = res.rows;
     }
 
-    if (active.length === 0 && archived.length === 0) return '';
+    // После точки — только задачи, созданные позже неё (выбранные строки
+    // фильтруются в JS: см. afterReset про микросекунды now()). Пустой остаток
+    // возвращает '' до эмбеддинга — платный вызов не нужен.
+    const activeAfter = afterReset(active, opts.since, (t) => t.created_at);
+    const archivedAfter = afterReset(archived, opts.since, (t) => t.created_at);
+
+    if (activeAfter.length === 0 && archivedAfter.length === 0) return '';
 
     // One embedding call для ранжирования обоих списков. Если ключ OpenAI
     // не настроен — qVec=null, активные берём по recency, archived recall
     // не делаем (без embedding'а ничего не сматчишь).
-    const qVec = userMessage ? await this.embed(userMessage) : null;
+    // Вектор нужен, только если активных больше TOP_ACTIVE (ранжирование) или
+    // есть архивные с embedding (recall); иначе платный вызов ничего не меняет.
+    const needVec = activeAfter.length > TOP_ACTIVE || archivedAfter.some(t => t.embedding);
+    const qVec = userMessage && needVec ? await this.embed(userMessage) : null;
 
     // Активные
     let selectedActive: TaskRow[];
-    if (active.length <= TOP_ACTIVE) {
-      selectedActive = active;
+    if (activeAfter.length <= TOP_ACTIVE) {
+      selectedActive = activeAfter;
     } else if (qVec) {
-      const scored = active.map(t => ({
+      const scored = activeAfter.map(t => ({
         t,
         score: t.embedding ? cosineSim(qVec, t.embedding) : -1,
       }));
       scored.sort((a, b) => b.score - a.score);
       selectedActive = scored.slice(0, TOP_ACTIVE).map(s => s.t);
     } else {
-      selectedActive = active.slice(0, TOP_ACTIVE);
+      selectedActive = activeAfter.slice(0, TOP_ACTIVE);
     }
 
     // Архивные (recall) — только если есть embedding юзер-реплики
     let selectedArchive: Array<{ t: TaskRow; score: number }> = [];
-    if (qVec && archived.length > 0) {
-      const scored = archived
+    if (qVec && archivedAfter.length > 0) {
+      const scored = archivedAfter
         .filter(t => t.embedding)
         .map(t => ({ t, score: cosineSim(qVec, t.embedding!) }));
       scored.sort((a, b) => b.score - a.score);
@@ -456,7 +482,12 @@ ${assistantMessage.slice(0, 3000)}
     return parsed;
   }
 
-  private async applyDecision(userId: string, agentId: number | null, decision: any): Promise<void> {
+  private async applyDecision(
+    userId: string,
+    agentId: number | null,
+    decision: any,
+    turnAt?: Date | null,
+  ): Promise<void> {
     if (!this.pg) return;
 
     if (decision.action === 'create') {
@@ -466,12 +497,17 @@ ${assistantMessage.slice(0, 3000)}
       const firstEvent = String(decision.firstEventContent || decision.summary || '').trim().slice(0, 2000);
       if (!title) return;
 
+      // created_at задачи — момент разговора, из которого она родилась, а не
+      // момент фоновой вставки: иначе точка «Чистого листа» пропускает старое
+      // (задача из хода до точки, вставленная после неё). Нечитаемая дата —
+      // now(): Invalid Date уронил бы INSERT и вместе с ним извлечение.
+      const createdAt = turnAt instanceof Date && Number.isFinite(turnAt.getTime()) ? turnAt : null;
       const embedding = await this.embed(`${title}\n${summary}\n${claudemd}`);
       const ins = await this.pg.query(
-        `INSERT INTO tasks (user_id, title, summary, claudemd, embedding, last_active_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, now(), now())
+        `INSERT INTO tasks (user_id, title, summary, claudemd, embedding, created_at, last_active_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), now(), now())
          RETURNING id`,
-        [userId, title, summary, claudemd, embedding],
+        [userId, title, summary, claudemd, embedding, createdAt],
       );
       const newId = ins.rows[0].id;
       if (firstEvent) {

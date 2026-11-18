@@ -1,9 +1,11 @@
-import { BadGatewayException, BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../../common/services/pg.service';
 import { ChatService } from '../chat.service';
+import { afterReset } from '../context-reset/after-reset';
+import { ChatContextResetService } from '../context-reset/context-reset.service';
 
 export interface ActionPlanItem {
   id: string;
@@ -75,11 +77,9 @@ function toPlan(row: ActionPlanRow): ActionPlan {
   };
 }
 
-function sessionIdFor(userId: string, assistantId: string, freshTs?: string): string {
-  if (freshTs !== undefined && freshTs !== '') {
-    if (!/^\d{6,}$/.test(freshTs)) throw new BadRequestException('invalid freshTs');
-    return `${userId}_${assistantId}_fresh_${freshTs}`;
-  }
+// Лента одна — spec 2026-11-17-context-reset: «Чистый лист» — точка отсчёта
+// памяти ассистента, а не отдельная переписка, и план — по основной ленте.
+function sessionIdFor(userId: string, assistantId: string): string {
   return `${userId}_${assistantId}`;
 }
 
@@ -90,6 +90,8 @@ export class ActionPlansService implements OnModuleInit {
   constructor(
     private readonly pg: PgService,
     private readonly chat: ChatService,
+    // @Optional: без сервиса точки план строится по всей выборке, как до неё.
+    @Optional() private readonly contextResets?: ChatContextResetService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -109,13 +111,23 @@ export class ActionPlansService implements OnModuleInit {
     this.logger.warn('action plans migration sql not found, skipping');
   }
 
-  async generate(userId: string, assistantId: string, freshTs?: string): Promise<ActionPlan> {
-    const sessionId = sessionIdFor(userId, assistantId, freshTs);
-    const history = await this.chat.getChatHistory(userId, assistantId, 30, 0,
-      freshTs ? sessionId : undefined);
-    const messages = history.messages.filter((message: any) => clipped(message?.content, 1));
+  async generate(userId: string, assistantId: string): Promise<ActionPlan> {
+    const sessionId = sessionIdFor(userId, assistantId);
+    const history = await this.chat.getChatHistory(userId, assistantId, 30, 0);
+    // После точки «Чистого листа» план — только по новому разговору: ассистент
+    // старое уже не учитывает, и план не должен его воскрешать. Сбой чтения
+    // точки — план по всей выборке, а не отказ; в журнале только id
+    // ассистента и вид ошибки (getOrNull), без userId и текста разговора.
+    const resetAt = await ChatContextResetService.getOrNull(
+      this.contextResets, userId, assistantId, (m) => this.logger.warn(m),
+    );
+    const messages = afterReset(history.messages, resetAt, (message: any) => message?.timestamp)
+      .filter((message: any) => clipped(message?.content, 1));
     if (!messages.some((message: any) => message.type === 'user') ||
         !messages.some((message: any) => message.type === 'assistant')) {
+      // Текст читает фронт (spirits_front src/services/actionPlansApi.ts,
+      // NOT_ENOUGH_CONVERSATION) и показывает «мало разговора» вместо общей
+      // ошибки — менять только вместе с ним.
       throw new BadRequestException('not enough conversation for an action plan');
     }
 
@@ -162,8 +174,8 @@ export class ActionPlansService implements OnModuleInit {
     return toPlan(result.rows[0]);
   }
 
-  async findForConversation(userId: string, assistantId: string, freshTs?: string): Promise<ActionPlan | null> {
-    return this.findBySession(userId, sessionIdFor(userId, assistantId, freshTs));
+  async findForConversation(userId: string, assistantId: string): Promise<ActionPlan | null> {
+    return this.findBySession(userId, sessionIdFor(userId, assistantId));
   }
 
   private async findBySession(userId: string, sessionId: string): Promise<ActionPlan | null> {

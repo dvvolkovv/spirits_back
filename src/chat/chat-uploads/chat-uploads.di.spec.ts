@@ -35,6 +35,12 @@ import { VoiceDocumentAccountDeletionAdapter } from '../../voice-call/voice-docu
 import { ChatFileAccountDeletionAdapter } from '../chat-files/chat-file-account-deletion.adapter';
 import { ChatUploadAccountDeletionAdapter } from './chat-upload-account-deletion.adapter';
 import { ChatUploadsService } from './chat-uploads.service';
+import { ChatService } from '../chat.service';
+import { ChatController } from '../chat.controller';
+import { ChatContextResetService } from '../context-reset/context-reset.service';
+import { ActionPlansService } from '../action-plans/action-plans.service';
+import { VoiceCallService } from '../../voice-call/voice-call.service';
+import { ContextService } from '../../context/context.service';
 
 jest.setTimeout(120000);
 
@@ -46,6 +52,13 @@ async function buildGraph(root: Type<any>): Promise<NestContainer> {
   const loader = new InstanceLoader(container, new Injector(), graphInspector);
   await loader.createInstancesOfDependencies();
   return container;
+}
+
+// Граф AppModule дорогой — строим один раз на файл.
+let appGraphPromise: Promise<NestContainer> | undefined;
+function appGraph(): Promise<NestContainer> {
+  const { AppModule } = require('../../app.module');
+  return (appGraphPromise ??= buildGraph(AppModule));
 }
 
 function find(container: NestContainer, cls: unknown): unknown {
@@ -77,8 +90,7 @@ describe('DI-граф загрузок чата', () => {
   });
 
   it('AppModule: адаптер chat-upload.purge и сервис загрузок разрешимы в реальном графе', async () => {
-    const { AppModule } = require('../../app.module');
-    const container = await buildGraph(AppModule);
+    const container = await appGraph();
     const adapter = find(container, ChatUploadAccountDeletionAdapter);
     expect(adapter).toBeInstanceOf(ChatUploadAccountDeletionAdapter);
     // Инжектировано именно StorageService, а не undefined/Object-заглушка.
@@ -101,5 +113,43 @@ describe('DI-граф загрузок чата', () => {
     await expect(buildGraph(BareAdapterModule)).rejects.toThrow(
       /ChatUploadAccountDeletionAdapter/,
     );
+  });
+});
+
+/**
+ * Точка «Чистого листа» (spec 2026-11-17-context-reset) у ChatService и
+ * ChatController — @Optional: забытый импорт ContextResetModule в ChatModule
+ * старт не уронит, а молча оставит прод без точки. Один экземпляр на граф —
+ * тот же, что пишет контроллер и читает ChatService. Граф AppModule — общий
+ * с проверкой загрузок выше (appGraph), второй раз не строится. Пины
+ * метаданных — в chat.controller.context-reset.spec.ts.
+ */
+describe('«Чистый лист»: один сервис точки у всех потребителей', () => {
+  it('AppModule: оба получают один и тот же ChatContextResetService', async () => {
+    const container = await appGraph();
+    const resets = find(container, ChatContextResetService);
+    expect(resets).toBeInstanceOf(ChatContextResetService);
+    expect((find(container, ChatService) as { contextResets?: unknown }).contextResets).toBe(resets);
+    expect((find(container, ChatController) as { contextResets?: unknown }).contextResets).toBe(resets);
+  });
+
+  // План действий строится по разговору после точки — сервис точки у него
+  // тоже @Optional, и забытая проводка молча воскресила бы старый разговор.
+  it('AppModule: ActionPlansService получает тот же ChatContextResetService', async () => {
+    const container = await appGraph();
+    const resets = find(container, ChatContextResetService);
+    expect(resets).toBeInstanceOf(ChatContextResetService);
+    expect((find(container, ActionPlansService) as { contextResets?: unknown }).contextResets).toBe(resets);
+  });
+
+  // Голос Романа и сборщик контекста («Из переписки») читают основную ленту —
+  // сервис точки у обоих @Optional, и забытая проводка молча вернула бы
+  // старый разговор в звонок.
+  it('AppModule: VoiceCallService и ContextService получают тот же ChatContextResetService', async () => {
+    const container = await appGraph();
+    const resets = find(container, ChatContextResetService);
+    expect(resets).toBeInstanceOf(ChatContextResetService);
+    expect((find(container, VoiceCallService) as { contextResets?: unknown }).contextResets).toBe(resets);
+    expect((find(container, ContextService) as { contextResets?: unknown }).contextResets).toBe(resets);
   });
 });

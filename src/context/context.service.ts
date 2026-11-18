@@ -4,6 +4,8 @@ import { TripService } from '../trip/trip.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { RecallService } from './recall.service';
+import { afterReset } from '../chat/context-reset/after-reset';
+import { ChatContextResetService } from '../chat/context-reset/context-reset.service';
 import {
   BuiltContext, ConsumerProfile, FALLBACK_TZ, PROFILES, SectionName, SectionStat, TOTAL_BUDGET,
 } from './context.types';
@@ -36,6 +38,10 @@ export class ContextService {
     @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly businessProfile?: BusinessProfileService,
     @Optional() private readonly recall?: RecallService,
+    // Точка «Чистого листа» — для раздела «Из переписки». Необязательная, как
+    // и остальное: без неё переписка идёт целиком, как до точки.
+    // Тип — класс (сторож design:paramtypes — context.history-reset.spec.ts).
+    @Optional() private readonly contextResets?: ChatContextResetService,
   ) {}
 
   async build(
@@ -129,7 +135,7 @@ export class ContextService {
       case 'now':           return this.sectionNow(tz);
       case 'today':         return this.sectionToday(userId, tz);
       case 'identity':      return this.sectionIdentity(userId);
-      case 'continuation':  return this.sectionContinuation(userId, budget);
+      case 'continuation':  return this.sectionContinuation(userId, opts.agentId, budget);
       case 'cloud_profile': return this.sectionCloudProfile(userId);
       case 'business':      return this.sectionBusiness(userId);
       case 'balance':       return this.sectionBalance(userId);
@@ -307,15 +313,21 @@ export class ContextService {
 
   private async sectionHistory(userId: string, agentId = 12, budget = TOTAL_BUDGET): Promise<string> {
     const res = await this.pg.query(
-      `SELECT sender_type, content FROM custom_chat_history
+      `SELECT sender_type, content, created_at FROM custom_chat_history
        WHERE session_id = $1 ORDER BY created_at DESC LIMIT 20`,
       [`${userId}_${agentId}`],
     );
     if (!res.rows?.length) return '';
+    // После точки «Чистого листа» — только разговор после неё: ассистент в
+    // чате старое уже забыл, и звонок не должен его возвращать. Ничего нового
+    // после точки — раздела нет, как при пустой ленте.
+    const resetAt = await this.contextResetAtSafe(userId, String(agentId));
+    const rows = afterReset(res.rows, resetAt, (r: any) => r.created_at);
+    if (!rows.length) return '';
     const head = '--- Из переписки ---\n';
     let left = budget - head.length;
     const lines: string[] = [];
-    for (const r of res.rows) {
+    for (const r of rows) {
       const who = r.sender_type === 'human' ? 'Пользователь' : 'Ассистент';
       const text = String(r.content || '').replace(/\s+/g, ' ').trim();
       if (!text) continue;
@@ -326,6 +338,11 @@ export class ContextService {
       lines.push(line);
     }
     return lines.length ? head + lines.reverse().join('\n') : '';
+  }
+
+  /** Точка «Чистого листа» пары; сбой чтения — без точки, warn без текста разговора. */
+  private contextResetAtSafe(userId: string, assistantId: string): Promise<Date | null> {
+    return ChatContextResetService.getOrNull(this.contextResets, userId, assistantId, (m) => this.logger.warn(m));
   }
 
   /**
@@ -346,10 +363,19 @@ export class ContextService {
    * условие в запросе не даёт подхватить самого себя. Прерванные звонки сюда
    * тоже попадают — реплики лежат в transcript, который воркер флашит по ходу
    * разговора, даже если резюме так и не собралось.
+   *
+   * Разговор, начатый до точки «Чистого листа» пары, — старый: после точки
+   * перезвон его не подхватывает (так же датируются задачи из звонка, см.
+   * VoiceCallService.consolidateCall). Сравнивается НАЧАЛО звонка, а не
+   * ended_at: ended_at — момент закрытия строки, а не разговора, его ставят и
+   * вытеснение заброшенного звонка новым (start → markInterrupted прямо перед
+   * сборкой преамбулы), и реапер. Звонок 10:00 с «грязным» концом, точка в
+   * 10:20, новый звонок в 10:25 закрывает старый — по ended_at Роман получил
+   * бы дословный хвост разговора 10:00. Окно в полчаса — по-прежнему от ended_at.
    */
-  private async sectionContinuation(userId: string, budget = TOTAL_BUDGET): Promise<string> {
+  private async sectionContinuation(userId: string, agentId = 12, budget = TOTAL_BUDGET): Promise<string> {
     const res = await this.pg.query(
-      `SELECT ended_at, transcript FROM voice_calls
+      `SELECT started_at, ended_at, transcript FROM voice_calls
         WHERE user_id = $1 AND ended_at IS NOT NULL
         ORDER BY started_at DESC LIMIT 1`,
       [userId],
@@ -363,6 +389,10 @@ export class ContextService {
     // Отрицательный возраст — расхождение часов, а не будущее: считаем «только что».
     const ageMs = Math.max(0, Date.now() - endedMs);
     if (ageMs > CONTINUATION_WINDOW_MS) return '';
+    // Тот же afterReset, что у переписки: проходит только звонок, начатый
+    // строго после точки. Без точки и при сбое её чтения — как раньше.
+    const resetAt = await this.contextResetAtSafe(userId, String(agentId));
+    if (!afterReset([row], resetAt, (r: any) => r.started_at).length) return '';
 
     const head =
       `--- Чем кончился прошлый разговор (${ContextService.agoText(ageMs)}) ---\n` +

@@ -62,8 +62,8 @@ const FENCED_BY_DELETED_GENERATION =
  * lockAndAssertCurrent; params каждого выражения — [userId, deletionId],
  * никаких литералов пользователя в SQL.
  *
- * Порядок: история и планы → профиль/бизнес-данные → связки входа →
- * tombstone учётки.
+ * Порядок: история, планы и точки «Чистого листа» → профиль/бизнес-данные →
+ * связки входа → tombstone учётки.
  */
 export async function deleteOwnedCoreRows(
   tx: SlotQueryable,
@@ -81,6 +81,20 @@ export async function deleteOwnedCoreRows(
   );
   await tx.query(
     `DELETE FROM action_plans
+      WHERE user_id = $1
+        AND ${FENCED_BY_DELETED_GENERATION}`,
+    params,
+  );
+  // Точки «Чистого листа» (spec 2026-11-17-context-reset) — та же судьба,
+  // что у истории: без неё точка смысла не имеет. Таблицу создаёт стартовая
+  // миграция ContextResetModule (onModuleInit). В API удаление запускают
+  // HTTP-вход и cron coordinator'а — оба оживают после onModuleInit, так что
+  // таблица к ним уже есть. Synthetic-скрипт удаления
+  // (scripts/account-deletion-synthetic.ts) таблицу не создаёт: запускать его
+  // только после выката ветки на test; иначе core упадёт без потерь
+  // (транзакция откатится).
+  await tx.query(
+    `DELETE FROM chat_context_resets
       WHERE user_id = $1
         AND ${FENCED_BY_DELETED_GENERATION}`,
     params,

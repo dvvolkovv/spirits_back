@@ -537,6 +537,8 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     // таблиц, не только discovery-стабов).
 
     await migration('chat/action-plans/migrations/001_action_plans.sql');
+    // Точки «Чистого листа»: core finalize стирает их той же транзакцией.
+    await migration('chat/context-reset/migrations/001_chat_context_resets.sql');
     await migration('chat/chat-uploads/migrations/001_chat_uploads.sql');
     // 002: execute chat-upload.purge читает thumb_key (миниатюры загрузок).
     await migration('chat/chat-uploads/migrations/002_chat_uploads_media_notes.sql');

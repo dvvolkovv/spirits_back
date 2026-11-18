@@ -183,18 +183,6 @@ async function uploadRun(body: any, events: any[]): Promise<{ fields: Record<str
   return { fields: fieldsOf((post.mock.calls[0] as any[])[1]), written: res.written };
 }
 
-describe('relaySessionKey', () => {
-  it('обычный ход: язык — часть ключа', () => {
-    expect(relaySessionKey('u1', '12', 'ru')).toBe('u1_12_ru');
-    expect(relaySessionKey('u1', '12', 'en')).toBe('u1_12_en');
-  });
-
-  it('чистый лист: ключ fresh-сессии перебивает всё', () => {
-    expect(relaySessionKey('u1', '12', 'ru', 'u1_12_fresh_1786468316338'))
-      .toBe('u1_12_fresh_1786468316338');
-  });
-});
-
 describe('uploadAndChat: файл уходит в сессию разговора, а не в свою', () => {
   afterEach(() => jest.clearAllMocks());
 
@@ -212,10 +200,103 @@ describe('uploadAndChat: файл уходит в сессию разговор�
     expect(fields.sessionId).toBe('u1_12_en');
   });
 
-  it('чистый лист: файл уходит в fresh-сессию, а не в основную', async () => {
+  it('чистый лист старого клиента: файл — в основную сессию, а не в fresh', async () => {
+    // Изолированной fresh-сессии у загрузок нет (spec 2026-11-17-context-reset):
+    // «Чистый лист» — точка в ключе. Без сервиса точки в этом харнесе ключ
+    // прежний — главное, что не fresh.
     const fields = await upload(makePg(), { fresh: 'true', freshTs: '1786468316338' });
 
-    expect(fields.sessionId).toBe('u1_12_fresh_1786468316338');
+    expect(fields.sessionId).toBe('u1_12_ru');
+    expect(fields.sessionId).not.toContain('_fresh_');
+  });
+
+  /**
+   * Тот же старый клиент, но с сервисом точки — как на проде: контроллер
+   * ставит точку на его метку ДО сборки handoff, и ключ релея уже с ней.
+   * resets общий у контроллера и сервиса, как общий провайдер в DI.
+   */
+  async function uploadWithResets(body: any, dropAssistantId = false) {
+    let stored: Date | null = null;
+    const resets = {
+      get: jest.fn(async () => stored),
+      reset: jest.fn(async (_u: string, _a: string, when?: Date) => {
+        stored = when ?? new Date();
+        return stored;
+      }),
+    };
+    const svc = makeService(makePg());
+    (svc as any).contextResets = resets;
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+    const ctrl = new ChatController(svc, jwtSvc as any, neo4j as any, undefined);
+    (ctrl as any).contextResets = resets;
+    const post = jest.fn(async () => ({ data: sseStream([{ type: 'delta', text: ANSWER }, { type: 'done' }]) }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = makeReq(body);
+    if (dropAssistantId) delete req.body.assistantId;
+    await ctrl.uploadAndChat(req, makeRes());
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+    return { resets, post, fields: fieldsOf((post.mock.calls[0] as any[])[1]) };
+  }
+
+  it('чистый лист старого клиента с сервисом точки: точка на его метку до релея, ключ релея — с ней', async () => {
+    const ts = Date.now() - 1000;
+    const { resets, post, fields } = await uploadWithResets({ fresh: 'true', freshTs: String(ts) });
+
+    expect(resets.reset).toHaveBeenCalledWith('u1', '12', new Date(ts));
+    expect(resets.reset.mock.invocationCallOrder[0]).toBeLessThan(post.mock.invocationCallOrder[0]);
+    expect(fields.sessionId).toBe(relaySessionKey('u1', '12', 'ru', undefined, new Date(ts)));
+  });
+
+  it('без assistantId (запасной «Роман») загрузка идёт, но точку не ставит', async () => {
+    // Сессия загрузки ключуется `${userId}_${assistantId}` с запасным 'Роман' —
+    // ключ допустим (resolveAgent находит ассистента по имени). Но точка — по
+    // адресу в той форме, что у reset-context (число или custom:<uuid>): точку
+    // под именем не поставит и не сотрёт ни одна другая ручка, и строки с
+    // произвольным id не копятся в chat_context_resets. Ход — без точки.
+    const ts = Date.now() - 1000;
+    const { resets, fields } = await uploadWithResets({ fresh: 'true', freshTs: String(ts) }, true);
+
+    expect(resets.reset).not.toHaveBeenCalled();
+    expect(fields.sessionId).toBe(relaySessionKey('u1', 'Роман', 'ru'));
+  });
+
+  it('кривой assistantId у загрузки — точку не ставит, файл уходит как обычно', async () => {
+    const ts = Date.now() - 1000;
+    const { resets, post } = await uploadWithResets({ fresh: 'true', freshTs: String(ts), assistantId: 'x'.repeat(101) });
+
+    expect(resets.reset).not.toHaveBeenCalled();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it('чистый лист старого клиента при нулевом балансе: точка ставится и до шлагбаума — как в текстовом ходе', async () => {
+    // В chat() точка ставится до streamChat, а шлагбаум нуля — внутри него.
+    // Загрузка обязана вести себя так же: иначе тот же старый клиент получал
+    // бы точку на тексте и не получал бы на файле.
+    const ts = Date.now() - 1000;
+    const resets = {
+      get: jest.fn(async () => null),
+      reset: jest.fn(async (_u: string, _a: string, when?: Date) => when ?? new Date()),
+    };
+    const pg = makePg();
+    const base = pg.query.getMockImplementation()!;
+    pg.query.mockImplementation(async (sql: string, params: any[] = []) =>
+      /SELECT tokens FROM ai_profiles_consolidated/.test(sql) ? { rows: [{ tokens: 0 }] } : base(sql, params));
+    const svc = makeService(pg);
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, undefined as any, undefined);
+    (ctrl as any).contextResets = resets;
+    const post = jest.fn();
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(makeReq({ fresh: 'true', freshTs: String(ts) }), res);
+
+    expect(resets.reset).toHaveBeenCalledWith('u1', '12', new Date(ts));
+    expect(post).not.toHaveBeenCalled();
+    expect(res.written.find((w: any) => w.type === 'end')?.reason).toBe('no_tokens');
   });
 
   it('везёт персону ассистента: иначе на файл ответит generic-агент релея', async () => {
@@ -419,6 +500,39 @@ describe('uploadAndChat: исходник сохраняется до релея
     // M6 (ревью 13.11.2026): успешное сохранение (failed=[]) не выдаёт
     // upload_persist_failed — событие только для реальных сбоев.
     expect(res.written.some((w: any) => w.type === 'upload_persist_failed')).toBe(false);
+  });
+
+  it('чистый лист старого клиента: исходник и ход — в основную ленту, не в fresh-сессию', async () => {
+    // Лента одна (spec 2026-11-17-context-reset). До задачи 5 исходник и ход
+    // уезжали в `_fresh_`-сессию, а релей и хвост — уже в основную: файл
+    // раскалывался между двумя лентами.
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] });
+    const pg = makePg();
+    const svc = makeService(pg);
+    // Без подмены: запись хода доходит до SQL, его и проверяем.
+    const persist = jest.spyOn(svc, 'persistUploadTurn');
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+    const ctrl = new (ChatController as any)(svc, jwtSvc, neo4j, undefined, undefined, chatUploads);
+    const post = jest.fn(async () => ({ data: sseStream([{ type: 'delta', text: ANSWER }, { type: 'done' }]) }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = makeUploadReq('a.pdf', 'что тут написано?');
+    req.body.fresh = 'true';
+    req.body.freshTs = String(Date.now() - 1000);
+
+    await ctrl.uploadAndChat(req, makeRes());
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    // Без сервиса точки в этом харнесе ключ релея прежний — главное, что не fresh.
+    const fields = fieldsOf((post.mock.calls[0] as any[])[1]);
+    expect(fields.sessionId).toBe('u1_12_ru');
+    expect((chatUploads.saveOriginals.mock.calls[0] as any[])[0].sessionId).toBe('u1_12');
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist.mock.calls[0][0]).not.toHaveProperty('sessionIdOverride');
+    const historyInserts = pg.calls.filter((c) => /INSERT INTO custom_chat_history/.test(c.sql));
+    expect(historyInserts).toHaveLength(2);
+    for (const c of historyInserts) expect(c.params[0]).toBe('u1_12');
   });
 });
 
@@ -637,6 +751,38 @@ describe('uploadAndChat: гейт consolidate (ревью I3)', () => {
     expect(consolidate.mock.calls[0][2]).toContain(UPLOAD_LINK);
     expect(consolidate.mock.calls[0][3]).toBe(ANSWER);
   });
+
+  it('момент хода — Date, снятый не позже запроса к релею', async () => {
+    // Ход с файлом самый долгий: момент, снятый в фоне после ответа, пустил бы
+    // задачу из старого файла за точку, нажатую сразу после ответа
+    // (spec 2026-11-17-context-reset).
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] });
+    const svc = makeService(makePg());
+    jest.spyOn(svc, 'persistUploadTurn').mockResolvedValue(0);
+    const consolidate = jest.spyOn(svc, 'consolidateAfterChatPublic').mockResolvedValue(undefined);
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+    const ctrl = new (ChatController as any)(svc, jwtSvc, neo4j, undefined, undefined, chatUploads);
+    const postAt: number[] = [];
+    const post = jest.fn(async () => {
+      postAt.push(Date.now());
+      // Релей думает: момент, снятый после ответа, был бы заметно позже запроса.
+      await new Promise((r) => setTimeout(r, 30));
+      return { data: sseStream([{ type: 'delta', text: ANSWER }, { type: 'done' }]) };
+    });
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const startedAt = Date.now();
+
+    await ctrl.uploadAndChat(makeUploadReq('a.pdf', 'что тут написано?'), makeRes());
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    expect(consolidate).toHaveBeenCalledTimes(1);
+    const turnAt = consolidate.mock.calls[0][4];
+    expect(turnAt).toBeInstanceOf(Date);
+    expect(turnAt!.getTime()).toBeGreaterThanOrEqual(startedAt);
+    expect(turnAt!.getTime()).toBeLessThanOrEqual(postAt[0]);
+  });
 });
 
 /**
@@ -699,7 +845,9 @@ describe('uploadAndChat: память прошлых загрузок в prompt 
     expect(fields.systemPrompt || '').not.toContain('Earlier user uploads');
   });
 
-  it('чистый лист: блок памяти ищется по fresh-сессии', async () => {
+  it('чистый лист старого клиента: блок памяти ищется по основной ленте', async () => {
+    // Лента одна (spec 2026-11-17-context-reset): файлы до точки отсекает
+    // точка, а не отдельная fresh-сессия.
     const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] }, [EARLIER_RECORD]);
     const req = makeUploadReq('a.pdf', 'что тут написано? (fresh)');
     req.body.fresh = 'true';
@@ -707,7 +855,7 @@ describe('uploadAndChat: память прошлых загрузок в prompt 
     const fields = await runMultipart(req, chatUploads);
 
     expect(chatUploads.recentForSession).toHaveBeenCalledWith(
-      'u1', 'u1_12_fresh_1786468316338', [UPLOAD_RECORD.id],
+      'u1', 'u1_12', [UPLOAD_RECORD.id],
     );
     expect(fields.message).toContain('b.pdf');
   });
