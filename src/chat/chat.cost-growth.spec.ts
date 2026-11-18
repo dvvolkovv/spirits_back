@@ -14,8 +14,10 @@ jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async 
  * 14.10.2026 каждый следующий ответ длинной сессии стоил дороже предыдущего, и
  * ни один алерт этого не видел. Сторож смотрит на СПИСАННОЕ — поэтому здесь
  * проверяется, что в него уходит ровно то число, что легло в списание, и
- * только когда списание действительно записано: пустой ответ, оборванный ход
- * и сбой записи истории до строки списания не доходят — значит, и до сторожа.
+ * только когда списание действительно записано: пустой ответ, несписанный
+ * сбой и сбой записи истории до строки списания не доходят — значит, и до
+ * сторожа. Оборванный ход, списанный за пришедшее (partial-billing.ts), —
+ * обычное списание: сторож его видит.
  *
  * Ожидания выводятся из курса SEAT_TOKENS_PER_USD, а не зашиты числами: смена
  * курса не должна красить тест, ничего не сказав о проводке.
@@ -112,18 +114,37 @@ describe('сторож роста стоимости: веб-чат, обычн�
     expect(await ctx.balance()).toBe(BALANCE);
   });
 
-  it('оборванный ход не выставлен — и в сторож не попадает', async () => {
+  it('сбой без ответа не выставлен — и в сторож не попадает', async () => {
+    const costGrowth = { recordTurn: jest.fn(async () => {}) };
+    const { svc, calls } = makeService(costGrowth);
+
+    await runTurn(svc, [
+      { type: 'delta', text: 'частичный текст' },
+      { type: 'notice', text: '_(модель недоступна)_' },
+      { type: 'done', costUsd: 0.5, failed: true, failReason: 'cli_fatal' },
+    ]);
+
+    expect(billingRow(calls)).toBeUndefined();
+    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
+  });
+
+  it('оборванный ход с текстом списан за пришедшее — сторож видит списанное', async () => {
     const costGrowth = { recordTurn: jest.fn(async () => {}) };
     const { svc, calls } = makeService(costGrowth);
 
     await runTurn(svc, [
       { type: 'delta', text: 'частичный текст' },
       { type: 'notice', text: '_(связь с моделью прервалась)_' },
-      { type: 'done', costUsd: 0.5, failed: true, failReason: 'transient_after_partial' },
+      // Стоимость хода (turnCostUsd), а не только costUsd: costUsd — сумма
+      // всей сессии, у оборванного хода в счёт не идёт (chat.partial-billing.spec.ts, P10).
+      { type: 'done', costUsd: 0.5, turnCostUsd: 0.5, failed: true, failReason: 'transient_after_partial' },
     ]);
 
-    expect(billingRow(calls)).toBeUndefined();
-    expect(costGrowth.recordTurn).not.toHaveBeenCalled();
+    expect(costGrowth.recordTurn).toHaveBeenCalledTimes(1);
+    const [, turn] = costGrowth.recordTurn.mock.calls[0] as any[];
+    expect(turn.tokens).toBe(forUsd(0.5));
+    const [, , , inputTokens, outputTokens] = billingRow(calls)!.params;
+    expect(turn.tokens).toBe(Number(inputTokens) + Number(outputTokens));
   });
 
   it('пустой ответ: usage пришёл, но списания нет — и сторожа тоже', async () => {

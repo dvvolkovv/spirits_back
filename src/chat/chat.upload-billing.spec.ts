@@ -148,8 +148,10 @@ describe('persistUploadTurn: ход с вложениями тарифициру
     expect(chargedTokens(pg.calls)).toBe(forUsd(1.25));
   });
 
-  it('прерванный ход не тарифицируется — обещание в тексте держится', async () => {
-    // Релей дописывает «Токены за прерванный ход не списаны» и шлёт failed:true.
+  it('сбой вне списка частичного списания не тарифицируется', async () => {
+    // 'interrupted' нет в PARTIAL_BILLED_REASONS (partial-billing.ts), текста
+    // модели вызов не передал — ход бесплатен, как и до 17.11.2026. Оборванный
+    // ход с пришедшим текстом — в chat.partial-billing.spec.ts (U1).
     const pg = makePg();
     const svc = makeService(pg);
 

@@ -11,7 +11,7 @@ import { V } from '../values';
 // источник: карточки вопросов — src/chat/ask-rule.ts; spirits_front src/components/chat/AskCard.tsx
 // источник: что умеют ассистенты — relay-agent/server.mjs (SYSTEM_PROMPT); src/chat/chat.service.ts (YouTube)
 // источник: find_files у Маши — src/chat/chat.service.ts (allowedTools: FIND_FILES_CLI_TOOL_NAME)
-// источник: оборванный ответ — spirits_front src/components/chat/streamFailure.ts, remoteTurn.ts:66; relay-agent/server.mjs (тексты сбоя)
+// источник: оборванный ответ — spirits_front src/components/chat/streamFailure.ts, remoteTurn.ts:66; relay-agent/server.mjs (тексты сбоя); списание оборванного хода — src/chat/partial-billing.ts
 export const chat: KbArticle = {
   id: 'chat',
   title: 'Чат с ассистентом',
@@ -41,7 +41,7 @@ ${q('chat')}: список ассистентов (на телефоне — о�
 
 ## Если не получается
 - Ответ ещё идёт — новые сообщения встают в очередь и уйдут после него. После перезагрузки страницы видно, что ассистент работает: ответ придёт сам; через пару минут появится ${q('sendAnyway')} — отправит сразу, обычно прервав прошлую работу ассистента (у Маши — нет).
-- Ответ оборвался или пришло сообщение о временном сбое — написать «продолжай»${paid('; оборванный ход не списывается')}.
+- Ответ оборвался или пришло сообщение о временном сбое — написать «продолжай»${paid('; оборванный ход оплачивается по сделанной работе')}.
 - Файл не отправляется — проверить размер и число файлов, добавить текст задания.
 - Голосовой ввод пишет не то — проверить язык профиля (${q('language')}).
 - Ничего не помогло — ${q('support')} в разделе ${q('help')}.
