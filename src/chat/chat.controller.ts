@@ -26,6 +26,9 @@ import { stripProductActionBlocks } from '../products/product-action-tail';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
+import { chatFailureText } from './chat-failure-texts';
+import { RelayDrainingError, logRelayDrainOutcome } from './relay-drain-retry';
+import { BlockJoiner } from './block-separator';
 // Строка истории `📎 [имя](url)` (шаблон и экранирование имени) — общая с
 // удалением загрузки (deleteForOwner ищет ровно эту строку), поэтому в
 // отдельном модуле.
@@ -488,14 +491,6 @@ export class ChatController {
       savedUploadIds: savedUploads.map((r) => r.id),
     });
 
-    // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
-    // больше не клеим: там он оседал копией на каждый ход с файлом. Память
-    // прошлых загрузок сессии (uploadContext) — наоборот, в теле: подписанные
-    // ссылки пер-ходовые, в кэшируемом systemPrompt им места нет.
-    const fullMessage = [handoff.uploadContext, message || 'Проанализируй этот файл']
-      .filter(Boolean)
-      .join('\n\n');
-
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
     // Модель ответов человека — тот же выбор, что у текстового хода
@@ -507,6 +502,23 @@ export class ChatController {
     // раннего gate в builder недостаточно. Возвращаются согласованные prompt,
     // sessionId и fs_key, поэтому resumed-сессия и папка хода не расходятся.
     handoff = await this.chatService.finalizeUploadHandoffForDispatch(userId, handoff);
+
+    // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
+    // больше не клеим: там он оседал копией на каждый ход с файлом. Память
+    // прошлых загрузок сессии (uploadContext) — наоборот, в теле: подписанные
+    // ссылки пер-ходовые, в кэшируемом systemPrompt им места нет.
+    //
+    // Если прошлый ход этой сессии ждёт релей за шлагбаумом выката, его текст
+    // идёт первым (relayCarryNote), а этот ход несёт его дальше (relayCarry).
+    // Оба — до beginRelayRun ниже: после него ждущий ход уже не текущий.
+    const carryNote = this.chatService.relayCarryNote(handoff.sessionId);
+    const relayCarry = this.chatService.relayCarryFor(handoff.sessionId, {
+      message,
+      files: files.map((f: any) => f.originalname),
+    });
+    const fullMessage = [carryNote, handoff.uploadContext, message || 'Проанализируй этот файл']
+      .filter(Boolean)
+      .join('\n\n');
 
     // Строка истории о файлах: сохранённые — markdown-ссылкой на приватное
     // скачивание (JWT владельца), несохранённые — прежним именем. При
@@ -527,27 +539,36 @@ export class ChatController {
     // Proxy file + message to remote agent server
     const FormData = require('form-data');
     const axios = require('axios');
-    const fd = new FormData();
-    // Поле `files` повторяется по разу на файл — так multipart и передаёт
-    // список. Агент это поле принимал и раньше, менялся только вход.
-    for (const f of files) {
-      fd.append('files', f.buffer, { filename: f.originalname, contentType: f.mimetype });
-    }
-    fd.append('message', fullMessage);
-    fd.append('sessionId', handoff.sessionId);
-    // Релей всегда передаёт --system-prompt и без нашего поля подставляет свой
-    // «universal agent»: в общей с текстовым ходом сессии это подменяло бы
-    // персону на каждом ходе с файлом.
-    if (handoff.systemPrompt) fd.append('systemPrompt', handoff.systemPrompt);
-    // Вставится только при холодном старте сессии — в resumed история уже есть.
-    if (handoff.history) fd.append('history', handoff.history);
-    // Продукты, поиск файлов и справка — те же поля, что у текстового хода.
-    fd.append('products_token', handoff.products.products_token);
-    fd.append('products_mcp_url', handoff.products.products_mcp_url);
-    // Инструменты Linkeon и папка хода — как у текстового хода (linkeon-relay-fields.ts).
-    appendLinkeonFields(fd, handoff.linkeon);
-    // Модель (личный выбор или рубильник) — релей сразу идёт к ней (answer-provider.ts).
-    for (const [k, v] of Object.entries(relayProviderFields(false, answerRoute.provider))) fd.append(k, v);
+    // Форма multipart — поток: на каждый повтор под шлагбаумом — новая
+    // (relay-drain-retry.ts). Буферы файлов в памяти, повтор их не теряет,
+    // но заливает заново: nginx релея по умолчанию принимает тело целиком до
+    // проксирования, так что каждый повтор — снова весь объём файлов, а
+    // буферы держатся в памяти, пока ход ждёт: до ~150 с пауз плюс время
+    // каждой заливки (партия до 100 МБ).
+    const buildForm = () => {
+      const fd = new FormData();
+      // Поле `files` повторяется по разу на файл — так multipart и передаёт
+      // список. Агент это поле принимал и раньше, менялся только вход.
+      for (const f of files) {
+        fd.append('files', f.buffer, { filename: f.originalname, contentType: f.mimetype });
+      }
+      fd.append('message', fullMessage);
+      fd.append('sessionId', handoff.sessionId);
+      // Релей всегда передаёт --system-prompt и без нашего поля подставляет свой
+      // «universal agent»: в общей с текстовым ходом сессии это подменяло бы
+      // персону на каждом ходе с файлом.
+      if (handoff.systemPrompt) fd.append('systemPrompt', handoff.systemPrompt);
+      // Вставится только при холодном старте сессии — в resumed история уже есть.
+      if (handoff.history) fd.append('history', handoff.history);
+      // Продукты, поиск файлов и справка — те же поля, что у текстового хода.
+      fd.append('products_token', handoff.products.products_token);
+      fd.append('products_mcp_url', handoff.products.products_mcp_url);
+      // Инструменты Linkeon и папка хода — как у текстового хода (linkeon-relay-fields.ts).
+      appendLinkeonFields(fd, handoff.linkeon);
+      // Модель (личный выбор или рубильник) — релей сразу идёт к ней (answer-provider.ts).
+      for (const [k, v] of Object.entries(relayProviderFields(false, answerRoute.provider))) fd.append(k, v);
+      return fd;
+    };
 
     // Set streaming headers
     res.status(200);
@@ -574,6 +595,14 @@ export class ChatController {
     const agentTurnCost = new RelayTurnCost();
     let turnFailed = false;
     let failReason = '';
+    // Текст МОДЕЛИ, ушедший человеку (delta/text/result), — без служебных
+    // реплик релея, ссылок на файлы и заглушки шлагбаума. По нему решается,
+    // было ли что списывать за оборванный ход, и считается длина для запасного
+    // пути списания (ChatService.turnChargeFor, partial-billing.ts).
+    let modelText = '';
+    // Исход ожидания релея за шлагбаумом выката: перебит новым сообщением
+    // той же сессии или бюджет повтора исчерпан (relay-drain-retry.ts).
+    let drainOutcome: 'superseded' | 'exhausted' | null = null;
     const streamStartTime = Date.now();
 
     // Если клиент дисконнектился (переключил ассистента), всё равно дочитываем
@@ -634,13 +663,19 @@ export class ChatController {
       if (!res.writableEnded) safeWrite({ type: 'ping' });
     });
     try {
-      const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
-        headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-        responseType: 'stream',
-        timeout: 600000,
-        maxRedirects: 0,
+      // axios здесь — require без типов: тип ответа postRelayTurn не выводится.
+      const agentRes: any = await this.chatService.postRelayTurn(handoff.sessionId, relayMark, relayCarry, () => {
+        const fd = buildForm();
+        return axios.default.post(`${AGENT_URL}/chat`, fd, {
+          headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+          responseType: 'stream',
+          timeout: 600000,
+          maxRedirects: 0,
+        });
       });
 
+      // Разделитель после шага работы — как у веб-хода (block-separator.ts).
+      const joiner = new BlockJoiner(() => chunks.join(''));
       await new Promise<void>((resolve) => {
         let buffer = '';
         agentRes.data.on('data', (chunk: Buffer) => {
@@ -652,14 +687,19 @@ export class ChatController {
             try {
               const ev = JSON.parse(line.slice(6));
               if (ev.type === 'delta' || ev.type === 'text') {
-                chunks.push(ev.text);
-                safeWrite({ type: 'item', content: ev.text });
+                const text = joiner.text(ev.text);
+                chunks.push(text);
+                // Текст модели — отдельно от служебных реплик (partial-billing.ts).
+                if (typeof text === 'string') modelText += text;
+                safeWrite({ type: 'item', content: text });
               } else if (ev.type === 'notice' && ev.text) {
                 // Служебная реплика платформы — показываем всегда, в отличие от
                 // `result` ниже (тот дублировал бы уже отданный текст).
-                chunks.push(ev.text);
-                safeWrite({ type: 'item', content: ev.text });
+                const text = joiner.text(ev.text);
+                chunks.push(text);
+                safeWrite({ type: 'item', content: text });
               } else if (ev.type === 'tool') {
+                joiner.tool();
                 // Шаг работы (activity-map.ts): чтение большого PDF — ровно то
                 // место, где человек дольше всего смотрит на пустой пузырь.
                 if (ui.activity) {
@@ -668,6 +708,7 @@ export class ChatController {
                 }
               } else if (ev.type === 'result' && ev.text && chunks.length === 0) {
                 chunks.push(ev.text);
+                modelText += String(ev.text);
                 safeWrite({ type: 'item', content: ev.text });
               } else if (ev.type === 'done') {
                 if (ev.failed === true) {
@@ -691,7 +732,26 @@ export class ChatController {
         agentRes.data.on('error', (err: Error) => { upstreamError = err; resolve(); });
       });
     } catch (err: any) {
-      upstreamError = err;
+      if (err instanceof RelayDrainingError) {
+        // Шлагбаум выката — штатный исход, не сбой; 502/ECONNREFUSED до конца
+        // бюджета — авария релея, error (logRelayDrainOutcome). chat_quality
+        // этот путь не пишет — relay_refusal только у веб-хода.
+        logRelayDrainOutcome(this.logger, err);
+        drainOutcome = err.superseded ? 'superseded' : 'exhausted';
+        turnFailed = true;
+        // Своя метка перебитого, не 'preempted' — как у веб-хода
+        // (streamUniversalAgent): ответ не потерян, а придёт со следующим ходом.
+        failReason = err.superseded ? 'relay_superseded' : 'relay_draining';
+        if (!err.superseded) {
+          // Релей обновлялся дольше бюджета повтора. Заглушка уходит в chunks —
+          // и клиенту, и в историю; turnFailed — без списания.
+          const stub = chatFailureText('relayUpdating', handoff.userLanguage, { upload: true, storeBuild });
+          chunks.push(stub);
+          safeWrite({ type: 'item', content: stub });
+        }
+      } else {
+        upstreamError = err;
+      }
     } finally {
       // Процесс релея этой сессии закончился (поток дочитан или упал) —
       // снимаем метку ДО копирования файлов ниже (до ~60 с): см. комментарий
@@ -734,17 +794,29 @@ export class ChatController {
       const fullText = stripProductActionBlocks(chunks.join(''));
 
       if (fullText.length > 0) {
-        // Индикатор считается тем же методом, что и списание в persistUploadTurn.
+        // Индикатор считается тем же вызовом и по тем же данным хода
+        // (ChatService.turnChargeFor, partial-billing.ts), что и списание в
+        // persistUploadTurn: и решение, списывать ли оборванный ход, и сумма.
         // Раньше здесь стояла длина ответа в символах: пользователь видел «2073
         // токена» за ход, за который не списали ничего.
-        const shown = turnFailed
-          ? 0
-          : this.chatService.computeUploadCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd).tokens;
-        safeWrite({ type: 'end', content: fullText, usage: { input: 0, output: shown, total: shown } });
+        const shown = this.chatService.turnChargeFor(
+          { text: fullText, failed: turnFailed, failReason, modelText, files: pendingFiles.length },
+          agentUsage, agentCostUsd, agentTurnCost.usd,
+        ).tokens;
+        safeWrite({
+          type: 'end',
+          content: fullText,
+          ...(drainOutcome === 'exhausted' ? { reason: 'relay_draining' } : {}),
+          usage: { input: 0, output: shown, total: shown },
+        });
       } else if (upstreamError) {
-        const errText = 'Ошибка обработки файла. Попробуйте ещё раз.';
+        const errText = chatFailureText('fileFailed', handoff.userLanguage);
         safeWrite({ type: 'item', content: errText });
         safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
+      } else if (drainOutcome === 'superseded') {
+        // Ждал релей, и его перебило новое сообщение — оно несёт текст и имена
+        // файлов этого хода. Тихий конец, без заглушки; reason — как у веб-хода.
+        safeWrite({ type: 'end', content: '', reason: 'superseded', usage: { input: 0, output: 0, total: 0 } });
       }
       clientPing?.stop();
       try { res.end(); } catch {}
@@ -767,7 +839,13 @@ export class ChatController {
       // сохранение» — ссылка на файл в истории должна остаться. Поведение
       // прежних путей не меняется: без сохранённых исходников персист, как
       // раньше, только при непустом ответе.
-      if (fullText.length > 0 || savedUploads.length > 0) {
+      //
+      // Перебитый под шлагбаумом ход — только строка человека (userOnly): его
+      // текст ушёл к модели с новым ходом, но написал его человек, и из
+      // истории он пропасть не должен (у веб-хода строка человека тоже
+      // остаётся). Пустой строки ассистента и списания нет.
+      const supersededByDrain = drainOutcome === 'superseded';
+      if (fullText.length > 0 || savedUploads.length > 0 || supersededByDrain) {
         persistDispatched = true;
         setImmediate(async () => {
           try {
@@ -782,13 +860,19 @@ export class ChatController {
               durationMs: Date.now() - streamStartTime,
               turnFailed,
               failReason,
+              modelText,
+              files: pendingFiles.length,
+              userLanguage: handoff.userLanguage,
+              storeBuild,
+              userOnly: supersededByDrain,
             });
             // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
             // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.
             // Пустой ответ — не материал для обучения профиля: LLM-вызов
             // только при тексте ассистента (в частности, при записи хода
-            // с пустым ответом ради ссылки на файл — не зовём).
-            if (fullText.length > 0) {
+            // с пустым ответом ради ссылки на файл — не зовём). Заглушка
+            // «обновляется» (шлагбаум выката) — тоже не материал для профиля.
+            if (fullText.length > 0 && !drainOutcome) {
               await this.chatService.consolidateAfterChatPublic(
                 userId,
                 assistantId,

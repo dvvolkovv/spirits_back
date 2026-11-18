@@ -9,6 +9,7 @@ import { AccountDeletionRegistry } from '../account-deletion/account-deletion.re
 import { DELETION_DISCOVERERS } from '../account-deletion/account-deletion.catalog';
 import {
   DeletionCancelledError,
+  DeletionRetryError,
   safeDeletionJobSnapshot,
 } from '../account-deletion/account-deletion.safe';
 import type {
@@ -397,6 +398,321 @@ maybe('peer account deletion against PostgreSQL (Task 17B)', () => {
     expect(msgs.map((m) => m.sender_id)).toEqual([USER]);
     const c = await rows(`SELECT user_a_id,user_b_id FROM peer_conversations WHERE id=$1`, [conv]);
     expect([c[0].user_a_id, c[0].user_b_id]).toEqual([USER, OTHER]);
+  });
+
+  // ==================== T17B-M5: частичный сбой и двойное удаление ====================
+
+  /**
+   * Снимок peer-таблиц без сгенерированных id и времени — по содержимому.
+   * Порядок детерминирован сортировкой по всем выводимым колонкам, поэтому
+   * два прогона над одинаковым посевом дают побайтно равные снимки.
+   */
+  async function peerSnapshot(): Promise<Record<string, any[]>> {
+    return {
+      conversations: await rows(
+        `SELECT c.user_a_id, c.user_b_id,
+                r.from_user_id AS req_from, r.to_user_id AS req_to
+           FROM peer_conversations c LEFT JOIN chat_requests r ON r.id = c.request_id
+          ORDER BY 1, 2`,
+      ),
+      messages: await rows(
+        `SELECT c.user_a_id, c.user_b_id, m.sender_id, m.content
+           FROM peer_messages m JOIN peer_conversations c ON c.id = m.conversation_id
+          ORDER BY m.created_at, m.sender_id`,
+      ),
+      requests: await rows(
+        `SELECT from_user_id, to_user_id, intro_message, status,
+                responded_at IS NOT NULL AS responded
+           FROM chat_requests ORDER BY 1, 2, 4, 3`,
+      ),
+      blocks: await rows(`SELECT blocker_id, blocked_id FROM user_blocks ORDER BY 1, 2`),
+      reports: await rows(
+        `SELECT reporter_id, target_id, reason, context_type, status, resolution
+           FROM user_reports ORDER BY reason`,
+      ),
+    };
+  }
+
+  /** Строки снимка, в которых не участвует ни один из ids (чужая история). */
+  function foreignOnly(snap: Record<string, any[]>, ids: string[]): Record<string, any[]> {
+    const out: Record<string, any[]> = {};
+    for (const [table, list] of Object.entries(snap)) {
+      out[table] = list.filter((row) => !Object.values(row).some((v) => ids.includes(v as string)));
+    }
+    return out;
+  }
+
+  const THIRD_A = 'u-third-a';
+  const THIRD_B = 'u-third-b';
+  const OWN_CANARY = 'СВОЙ-ТЕКСТ-УДАЛЁННОГО';
+  const DB_DOWN = Object.assign(new Error('connection terminated (spec)'), { code: '08006' });
+
+  /**
+   * Посев «всё сразу»: каждая из семи операций purge находит свою работу,
+   * плюс чужая история третьих лиц, которой purge касаться не должен.
+   */
+  async function seedRichPeerHistory(): Promise<void> {
+    const accepted = await seedRequest(OTHER, USER, 'их интро', 'accepted');
+    const conv = await seedConversation(USER, OTHER);
+    await pool.query(`UPDATE peer_conversations SET request_id=$1 WHERE id=$2`, [accepted, conv]);
+    await seedMessage(conv, USER, OWN_CANARY, '2026-10-01T00:00:00Z');
+    await seedMessage(conv, OTHER, 'ответ другого', '2026-10-01T00:01:00Z');
+    await seedMessage(conv, USER, `${OWN_CANARY}-2`, '2026-10-01T00:02:00Z');
+    const low = await seedConversation(USER, 'a-user');
+    await seedMessage(low, 'a-user', 'a-user пишет', '2026-10-02T00:00:00Z');
+    const foreign = await seedConversation(THIRD_A, THIRD_B);
+    await seedMessage(foreign, THIRD_A, 'чужая переписка', '2026-10-03T00:00:00Z');
+    await seedMessage(foreign, THIRD_B, 'чужой ответ', '2026-10-03T00:01:00Z');
+
+    await seedRequest(USER, OTHER, OWN_CANARY, 'withdrawn');
+    await seedRequest(THIRD_A, USER, 'входящая от третьего');
+    await seedRequest(THIRD_A, THIRD_B, 'чужая заявка');
+
+    await pool.query(
+      `INSERT INTO user_blocks (blocker_id,blocked_id)
+       VALUES ($1,'u-victim'), ('u-blocker',$1), ($2,$3)`,
+      [USER, THIRD_A, THIRD_B],
+    );
+    await pool.query(
+      `INSERT INTO user_reports (reporter_id,target_id,reason,context_type,status,resolution)
+       VALUES ($1,'u-reported','r1 моя жалоба','conversation','new',NULL),
+              ('u-reporter2',$1,'r2 жалоба на меня',NULL,'resolved','warned'),
+              ($2,$3,'r3 чужая жалоба',NULL,'new',NULL)`,
+      [USER, THIRD_A, THIRD_B],
+    );
+  }
+
+  /**
+   * ctx, чей db роняет N-й запрос. 'before' — запрос не исполнен (обрыв до
+   * отправки); 'after' — запрос исполнен и закоммичен (autocommit, раннер
+   * отдаёт адаптеру pool без транзакции), но ответ потерян.
+   */
+  function failingCtx(failAt: number, mode: 'before' | 'after') {
+    let n = 0;
+    const executed: string[] = [];
+    const ctx: DeletionExecution = {
+      db: {
+        query: async (sql: string, params?: unknown[]) => {
+          n += 1;
+          if (n === failAt && mode === 'before') throw DB_DOWN;
+          const result = await pool.query(sql, params as any[]);
+          executed.push(sql.replace(/\s+/g, ' ').trim().slice(0, 40));
+          if (n === failAt && mode === 'after') throw DB_DOWN;
+          return result;
+        },
+      },
+      assertCurrent: jest.fn(async () => undefined),
+    };
+    return { ctx, executed: () => executed, calls: () => n };
+  }
+
+  async function cleanPurgeSnapshot(): Promise<Record<string, any[]>> {
+    await pool.query(
+      `TRUNCATE peer_messages, peer_conversations, chat_requests, user_blocks, user_reports`,
+    );
+    await seedRichPeerHistory();
+    await adapter.execute(jobRow('peer.purge'), makeCtx());
+    return peerSnapshot();
+  }
+
+  // purge — семь statement'ов (messages, redact, requests, conversations,
+  // blocks out, blocks in, reports); роняем каждый в обоих режимах.
+  const PURGE_STATEMENTS = 7;
+  const failurePoints = Array.from({ length: PURGE_STATEMENTS }, (_, i) => i + 1)
+    .flatMap((failAt) => (['before', 'after'] as const).map((mode) => ({ failAt, mode })));
+
+  it('purge без сбоя делает ровно PURGE_STATEMENTS запросов — новый запрос не останется без точки сбоя', async () => {
+    await seedRichPeerHistory();
+    // failAt за пределами прогона: ни один запрос не роняется, только счёт.
+    const counting = failingCtx(Number.MAX_SAFE_INTEGER, 'before');
+
+    await adapter.execute(jobRow('peer.purge'), counting.ctx);
+
+    expect(counting.calls()).toBe(PURGE_STATEMENTS);
+    expect(counting.executed()).toHaveLength(PURGE_STATEMENTS);
+  });
+
+  it.each(failurePoints)(
+    'частичный сбой purge на запросе $failAt ($mode): retry сходится к итогу чистого прогона без дублей',
+    async ({ failAt, mode }) => {
+      await seedRichPeerHistory();
+      const before = await peerSnapshot();
+      const failing = failingCtx(failAt, mode);
+
+      const error = await adapter.execute(jobRow('peer.purge'), failing.ctx).catch((e) => e);
+
+      // Сбой не проглочен и классифицирован как retryable db-ошибка.
+      expect(error).toBeInstanceOf(DeletionRetryError);
+      expect(error.kind).toBe('db');
+      // Purge остановился на упавшем запросе, следующие не исполнялись.
+      expect(failing.calls()).toBe(failAt);
+      expect(failing.executed()).toHaveLength(mode === 'after' ? failAt : failAt - 1);
+
+      // Повтор задачи (воркер подхватит failed-строку) — штатный ctx.
+      await expect(adapter.execute(jobRow('peer.purge'), makeCtx())).resolves.toBeUndefined();
+      const afterRetry = await peerSnapshot();
+
+      // Чужая история третьих лиц не тронута ни сбоем, ни повтором.
+      expect(foreignOnly(afterRetry, [USER, ALIAS])).toEqual(foreignOnly(before, [USER, ALIAS]));
+      // Без дублей и без потерь чужих строк: число разговоров/заявок/жалоб то же,
+      // сообщений меньше ровно на свои два, блокировок — на одну исходящую.
+      expect(afterRetry.conversations).toHaveLength(before.conversations.length);
+      expect(afterRetry.requests).toHaveLength(before.requests.length);
+      expect(afterRetry.reports).toHaveLength(before.reports.length);
+      expect(afterRetry.messages).toHaveLength(before.messages.length - 2);
+      expect(afterRetry.blocks).toHaveLength(before.blocks.length - 1);
+      const dump = JSON.stringify(afterRetry);
+      expect(dump).not.toContain(`"${USER}"`);
+      expect(dump).not.toContain(OWN_CANARY);
+      expect(dump).toContain(ALIAS);
+
+      // Итог совпадает с чистым (безотказным) прогоном над тем же посевом.
+      expect(afterRetry).toEqual(await cleanPurgeSnapshot());
+    },
+  );
+
+  describe('оба партнёра переписки удалены (alias поверх alias)', () => {
+    const PARTNER = 'u-partner';
+    const THIRD = 'u-third';
+    const PARTNER_DELETION = '2b6f0c1d-8e4a-4f3b-9c2d-7a1e5b9f0c3d';
+    const PARTNER_ALIAS = `deleted:${PARTNER_DELETION}`;
+    const A_CANARY = 'ТЕКСТ-ПЕРВОГО-УДАЛЁННОГО';
+    const B_CANARY = 'ТЕКСТ-ВТОРОГО-УДАЛЁННОГО';
+
+    function partnerJob(resourceType: 'peer.stop' | 'peer.purge'): DeletionJobRow {
+      return jobRow(resourceType, {
+        id: `job-partner-${resourceType}`,
+        userId: PARTNER,
+        deletionId: PARTNER_DELETION,
+      });
+    }
+
+    async function seedPair(): Promise<void> {
+      await seedUser(PARTNER, 'deleted', PARTNER_DELETION);
+      await seedUser(THIRD, 'active');
+
+      const accepted = await seedRequest(PARTNER, USER, B_CANARY, 'accepted');
+      const pair = await seedConversation(USER, PARTNER);
+      await pool.query(`UPDATE peer_conversations SET request_id=$1 WHERE id=$2`, [accepted, pair]);
+      await seedMessage(pair, USER, A_CANARY, '2026-10-01T00:00:00Z');
+      await seedMessage(pair, PARTNER, B_CANARY, '2026-10-01T00:01:00Z');
+      const withThirdB = await seedConversation(PARTNER, THIRD);
+      await seedMessage(withThirdB, PARTNER, `${B_CANARY}-2`, '2026-10-02T00:00:00Z');
+      await seedMessage(withThirdB, THIRD, 'третий пишет второму', '2026-10-02T00:01:00Z');
+      const withThirdA = await seedConversation(USER, THIRD);
+      await seedMessage(withThirdA, THIRD, 'третий пишет первому', '2026-10-03T00:00:00Z');
+
+      await seedRequest(USER, PARTNER, A_CANARY, 'withdrawn');
+      await seedRequest(THIRD, PARTNER, 'третий зовёт второго');
+      await seedRequest(PARTNER, THIRD, `${B_CANARY}-3`);
+
+      await pool.query(
+        `INSERT INTO user_blocks (blocker_id,blocked_id)
+         VALUES ($1,$2), ($2,$1), ($3,$1), ($3,$2)`,
+        [USER, PARTNER, THIRD],
+      );
+      await pool.query(
+        `INSERT INTO user_reports (reporter_id,target_id,reason,status)
+         VALUES ($1,$2,'r1 первый на второго','new'),
+                ($2,$1,'r2 второй на первого','new'),
+                ($3,$2,'r3 третий на второго','new')`,
+        [USER, PARTNER, THIRD],
+      );
+    }
+
+    async function deleteBoth(order: 'first-then-partner' | 'partner-then-first'): Promise<void> {
+      const first = async () => {
+        await adapter.execute(jobRow('peer.stop'), makeCtx());
+        await adapter.execute(jobRow('peer.purge'), makeCtx());
+      };
+      const partner = async () => {
+        await adapter.execute(partnerJob('peer.stop'), makeCtx());
+        await adapter.execute(partnerJob('peer.purge'), makeCtx());
+      };
+      if (order === 'first-then-partner') {
+        await first();
+        await partner();
+      } else {
+        await partner();
+        await first();
+      }
+    }
+
+    it.each(['first-then-partner', 'partner-then-first'] as const)(
+      'история второго обезличена поверх alias первого, данные третьего целы (%s)',
+      async (order) => {
+        await seedPair();
+
+        await deleteBoth(order);
+        const snap = await peerSnapshot();
+
+        const [lo, hi] = [ALIAS, PARTNER_ALIAS].sort();
+        // Разговор пары остался оболочкой из двух alias (CHECK a<b и UNIQUE
+        // держатся), ссылка на заявку цела; сообщений обоих удалённых нет.
+        expect(snap.conversations).toEqual(expect.arrayContaining([
+          { user_a_id: lo, user_b_id: hi, req_from: PARTNER_ALIAS, req_to: ALIAS },
+          { user_a_id: ALIAS, user_b_id: THIRD, req_from: null, req_to: null },
+          { user_a_id: PARTNER_ALIAS, user_b_id: THIRD, req_from: null, req_to: null },
+        ]));
+        expect(snap.conversations).toHaveLength(3);
+        // Остаются только сообщения третьего — в разговорах с alias обоих.
+        expect(snap.messages).toEqual([
+          { user_a_id: PARTNER_ALIAS, user_b_id: THIRD, sender_id: THIRD, content: 'третий пишет второму' },
+          { user_a_id: ALIAS, user_b_id: THIRD, sender_id: THIRD, content: 'третий пишет первому' },
+        ]);
+        // Заявки: intro обоих удалённых стёрты, заявка третьего сохранила текст;
+        // исходящая pending второго отозвана его stop'ом.
+        expect(snap.requests).toEqual(expect.arrayContaining([
+          { from_user_id: ALIAS, to_user_id: PARTNER_ALIAS, intro_message: '', status: 'withdrawn', responded: false },
+          { from_user_id: PARTNER_ALIAS, to_user_id: ALIAS, intro_message: '', status: 'accepted', responded: false },
+          { from_user_id: PARTNER_ALIAS, to_user_id: THIRD, intro_message: '', status: 'withdrawn', responded: true },
+          { from_user_id: THIRD, to_user_id: PARTNER_ALIAS, intro_message: 'третий зовёт второго', status: 'pending', responded: false },
+        ]));
+        expect(snap.requests).toHaveLength(4);
+        // Блокировки: взаимные исходящие удалённых сняты, блокировки третьего —
+        // на alias каждого.
+        expect(snap.blocks).toEqual(
+          [
+            { blocker_id: THIRD, blocked_id: ALIAS },
+            { blocker_id: THIRD, blocked_id: PARTNER_ALIAS },
+          ].sort((x, y) => (x.blocked_id < y.blocked_id ? -1 : 1)),
+        );
+        // Жалобы: обе стороны — alias, reason (доказательство модерации) цел.
+        expect(snap.reports).toEqual([
+          { reporter_id: ALIAS, target_id: PARTNER_ALIAS, reason: 'r1 первый на второго', context_type: null, status: 'new', resolution: null },
+          { reporter_id: PARTNER_ALIAS, target_id: ALIAS, reason: 'r2 второй на первого', context_type: null, status: 'new', resolution: null },
+          { reporter_id: THIRD, target_id: PARTNER_ALIAS, reason: 'r3 третий на второго', context_type: null, status: 'new', resolution: null },
+        ]);
+        const dump = JSON.stringify(snap);
+        for (const leaked of [`"${USER}"`, `"${PARTNER}"`, A_CANARY, B_CANARY]) {
+          expect(dump).not.toContain(leaked);
+        }
+        // Профильные строки не переименовываются (alias только в peer-таблицах).
+        expect(await rows(`SELECT internal_id FROM user_id ORDER BY 1`)).toEqual(
+          [OTHER, PARTNER, USER, THIRD].sort().map((internal_id) => ({ internal_id })),
+        );
+      },
+    );
+
+    it('итог не зависит от порядка удаления партнёров; повтор обоих purge — no-op', async () => {
+      await seedPair();
+      await deleteBoth('first-then-partner');
+      const forward = await peerSnapshot();
+
+      await pool.query(
+        `TRUNCATE peer_messages, peer_conversations, chat_requests, user_blocks, user_reports`,
+      );
+      await pool.query(`DELETE FROM user_id WHERE internal_id IN ($1,$2)`, [PARTNER, THIRD]);
+      await seedPair();
+      await deleteBoth('partner-then-first');
+      const backward = await peerSnapshot();
+
+      expect(backward).toEqual(forward);
+
+      await adapter.execute(jobRow('peer.purge'), makeCtx());
+      await adapter.execute(partnerJob('peer.purge'), makeCtx());
+      expect(await peerSnapshot()).toEqual(backward);
+    });
   });
 
   describe('active guard: sendRequest/sendMessage/block/report не создают rows для deleted', () => {

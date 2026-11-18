@@ -4,6 +4,7 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TalerIdNotesConnector } from '../talerid/talerid-notes.connector';
 import { ChatService } from '../chat/chat.service';
+import { RELAY_DRAIN_DELAYS_SHORT_MS } from '../chat/relay-drain-retry';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import { voiceDocumentKey } from './voice-document-key';
@@ -81,10 +82,14 @@ export class VoiceDocumentService {
       const body = instructions?.trim()
         ? `${note}\n\nПодготовить документ «${title}».\n\n${instructions.trim()}`
         : `${note}\n\nПодготовить документ «${title}».`;
+      // K1b: гейт на живой аккаунт в самом INSERT (форма saveUserMessageRow,
+      // Task 11): assertActive стоит раньше, и между ними есть await'ы.
+      // userId — последним параметром, позиции content/tokens не меняются.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-         VALUES ($1, 'human', $2, $3, 'text')`,
-        [`${userId}_${agentId}`, agentId, body],
+         SELECT $1, 'human', $2, $3, 'text'
+         WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+        [`${userId}_${agentId}`, agentId, body, userId],
       );
     } catch (e: any) {
       this.logger.warn(`задание на документ не записано в чат agent=${agentId}: ${e?.message}`);
@@ -105,10 +110,13 @@ export class VoiceDocumentService {
       ? `Документ «${title}» подготовить не успел — задача оказалась слишком объёмной. Попроси ещё раз, можно короче.`
       : `Документ «${title}» подготовить не удалось.`;
     try {
+      // K1b: зовётся из catch без проверки аккаунта — сбой после удаления не
+      // должен оставлять строку в чате удалённого. Гейт — как в recordRequest.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-         VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-        [`${userId}_${agentId}`, agentId, text],
+         SELECT $1, 'ai', $2, $3, 'text', 0
+         WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+        [`${userId}_${agentId}`, agentId, text, userId],
       );
     } catch { /* и это не повод ронять задачу */ }
   }
@@ -267,8 +275,13 @@ export class VoiceDocumentService {
         `сохраняй, а не пересказывай общими словами.` +
         (prev ? `\nСтарое содержание не выбрасывай: дополняй, а не заменяй.` : '');
 
+      // withTimeout ход не отменяет — релей на выкате ждём коротко, чтобы
+      // генерации хватило места в DOC_TIMEOUT_MS.
       const reply = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_note_${callId}`),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(HOST_AGENT_ID), prompt, `voice_note_${callId}`,
+          { relayDrainDelaysMs: RELAY_DRAIN_DELAYS_SHORT_MS },
+        ),
         DOC_TIMEOUT_MS,
       );
       const body = (reply.text || '').trim();
@@ -454,8 +467,12 @@ export class VoiceDocumentService {
 
       // Изолированная сессия — как у вопросов специалистам: при коллизии с
       // живой сессией пользователя релей отдаёт пустой поток (инцидент 2026-07-12).
+      // Релей на выкате ждём коротко — как у заметки выше.
       const reply = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(agentId), prompt, `voice_doc_${callId}_${docId}`),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(agentId), prompt, `voice_doc_${callId}_${docId}`,
+          { relayDrainDelaysMs: RELAY_DRAIN_DELAYS_SHORT_MS },
+        ),
         DOC_TIMEOUT_MS,
       );
       const body = (reply.text || '').trim();
@@ -478,10 +495,13 @@ export class VoiceDocumentService {
         ? `## ${title}\n\n${VoiceDocumentService.lead(body)}\n\n[Открыть документ полностью](${url})`
         : `## ${title}\n\n${body}`;
 
+      // K1b: второй assertActive выше отделён от записи публикацией в MinIO —
+      // гейт ещё и в самом INSERT, как в recordRequest.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-         VALUES ($1, 'ai', $2, $3, 'text', $4)`,
-        [`${userId}_${agentId}`, agentId, content, reply.tokens],
+         SELECT $1, 'ai', $2, $3, 'text', $4
+         WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $5 AND u.state = 'active')`,
+        [`${userId}_${agentId}`, agentId, content, reply.tokens, userId],
       );
 
       await this.charge(userId, agentId, title, reply.tokens);

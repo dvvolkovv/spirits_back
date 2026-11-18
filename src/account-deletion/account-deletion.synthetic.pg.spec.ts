@@ -67,6 +67,7 @@ const ALL_STOP_TYPES = [
   'account.core.immediate',
   'auth-verification.stop',
   'calendar.stop',
+  'contacts.stop',
   'guest-carry.stop',
   'integration.apple.stop',
   'integration.talerid.stop',
@@ -855,6 +856,16 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     );
     expect(await stoppedResources(first.deletionId)).toEqual(ALL_STOP_TYPES);
     expect(await externalIdsPresent(fixture.mainUserId)).toBe(true);
+    // K6: contacts.stop отменил висящую заявку удалённого соседу — одобрить
+    // её (и получить телефон удалённого) больше нельзя.
+    const contactRequests = await rows(
+      `SELECT cr.status, cr.resolved_at IS NOT NULL AS resolved
+         FROM contact_requests cr
+         JOIN ai_profiles_consolidated ap ON ap.id = cr.requester_id
+        WHERE ap.user_id = $1`,
+      [fixture.mainUserId],
+    );
+    expect(contactRequests).toEqual([{ status: 'cancelled', resolved: true }]);
 
     // --- Фаза 2: реактивация прод-путём отменяет поколение; прогон
     // runAccount по старому deletionId не касается нового аккаунта.

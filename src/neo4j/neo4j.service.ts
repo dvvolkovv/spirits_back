@@ -437,7 +437,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
           { phone: userId, name, canonicalKey },
         );
       }
-      this.logger.log(`replaceEntities: ${type} for ${userId} → ${values.length} items`);
+      this.logger.log(`replaceEntities: ${type} → ${values.length} items`);
     } catch (e) {
       this.logger.error(`replaceEntities error: ${e.message}`);
     } finally {
@@ -522,6 +522,11 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     canonical: string,
   ): Promise<void> {
     if (!fromKeys.length || !canonical?.trim()) return;
+    // K1b: компакция могла идти в момент удаления — MERGE ниже воскресил бы
+    // узел Profile удалённого. Проверка — ДО чтения группы и снятия связей:
+    // любой отказ (неактивен, сбой запроса, нет PgService) ничего не меняет.
+    // Иначе сбой гейта после DELETE r оставлял живого без группы сущностей.
+    if (!this.pg || !(await this.isAccountActive(this.pg, userId))) return;
     const session = this.getSession();
     if (!session) return;
     const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
@@ -631,6 +636,26 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     return null;
   }
 
+  /**
+   * K1: активен ли аккаунт (прецедент — TasksService.isAccountActive). Зовётся
+   * непосредственно перед каждой записью в граф: после удаления profile_data =
+   * '{}', и automaticProfilingAllowed такой профиль пропускает — без проверки
+   * ход, начатый до удаления, заново создавал бы граф. Ошибка запроса уходит в
+   * catch вызывающего — записи нет.
+   * Остаточное окно: проверка стоит на группу записей, а не на каждый Cypher. Для сущностей
+   * это N последовательных session.run в updateProfileEntities (по одному на значение), и
+   * удаление может прийти между SELECT и любым из них; счётчик и эмбеддинг — по одному
+   * обращению; merge компакции — два (DELETE r и MERGE; гейт там стоит до чтения группы).
+   * Postgres и Neo4j одной транзакцией не связать.
+   */
+  private async isAccountActive(pg: PgService, userId: string): Promise<boolean> {
+    const res = await pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    return (res.rowCount ?? res.rows?.length ?? 0) > 0;
+  }
+
   async consolidateFromChat(
     userId: string,
     agentId: string,
@@ -695,13 +720,16 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
 
       const extracted = this.extractJsonObject(content);
       if (!extracted) {
-        this.logger.warn(`consolidateFromChat: failed to parse JSON for ${userId}_${agentId}; raw[0..200]=${content.slice(0, 200)}`);
+        // Только размер: сырой ответ несёт интересы и убеждения человека
+        // (правило журналов с 02.11, cb92f71f — вид, статус, размеры).
+        this.logger.warn(`consolidateFromChat: failed to parse JSON (agent=${agentId}); raw.length=${content.length}`);
         return;
       }
       const entityTypes = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
       for (const type of entityTypes) {
         if (Array.isArray(extracted[type]) && extracted[type].length > 0) {
           if (!(await automaticProfilingAllowed(pg, userId))) return;
+          if (!(await this.isAccountActive(pg, userId))) return;
           await this.updateProfileEntities(userId, type.slice(0, -1), extracted[type]); // remove 's'
         }
       }
@@ -715,6 +743,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
             { phone: userId },
           );
           if (!(await automaticProfilingAllowed(pg, userId))) return;
+          if (!(await this.isAccountActive(pg, userId))) return;
           const cnt = (res.records[0]?.get('cnt')?.toNumber?.() || res.records[0]?.get('cnt') || 0) + 1;
           await session2.run(
             'MERGE (p:Profile {phone: $phone}) SET p.consolidation_count = $cnt',
@@ -755,6 +784,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       if (!(await automaticProfilingAllowed(pg, userId))) return;
       const embedding = resp.data?.data?.[0]?.embedding;
       if (!embedding || !Array.isArray(embedding)) return;
+      if (!(await this.isAccountActive(pg, userId))) return;
 
       // Store embedding in Neo4j
       const session = this.getSession();
@@ -764,7 +794,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
           'MERGE (p:Profile {phone: $phone}) SET p.embedding = $embedding, p.embeddingUpdatedAt = datetime()',
           { phone: userId, embedding },
         );
-        this.logger.log(`Embedding updated for ${userId} (${embedding.length} dims)`);
+        this.logger.log(`Embedding updated (${embedding.length} dims)`);
       } finally {
         await session.close();
       }

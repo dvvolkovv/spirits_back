@@ -218,11 +218,14 @@ export class InsightsCollectService {
     return out;
   }
 
+  // Ход, перебитый под шлагбаумом выката релея (relay_superseded), — не сбой:
+  // его текст ушёл со следующим сообщением. Так же — в quality-monitor.
   private async badTurns(p: unknown[]): Promise<number> {
     const r = await this.pg.query(
       `SELECT count(*)::int AS bad FROM events e
         WHERE e.name = 'chat_quality' AND e.ts >= $1 AND e.ts < $2 AND e.user_id IS NOT NULL
           AND (COALESCE((e.props->>'empty')::boolean, false) OR COALESCE((e.props->>'failed')::boolean, false))
+          AND COALESCE(e.props->>'fail_reason', '') <> 'relay_superseded'
           AND ${liveUserSql('e.user_id')}`,
       p,
     );

@@ -15,6 +15,21 @@ describe('silenceSignals', () => {
   });
 });
 
+/**
+ * Ход, перебитый под шлагбаумом выката релея (fail_reason relay_superseded),
+ * — не сбой: его текст ушёл со следующим сообщением. Как в метрике качества
+ * (quality-monitor.exclusions.spec.ts), в «пустые и упавшие» он не идёт.
+ */
+describe('пустые и упавшие ответы: запрос', () => {
+  it('не считает ход, перебитый под шлагбаумом выката релея', async () => {
+    const queries: string[] = [];
+    const pg = { query: jest.fn(async (sql: string) => { queries.push(sql); return { rows: [{ bad: 0 }] }; }) };
+    await (new InsightsCollectService(pg as any) as any).badTurns(['2026-10-19', '2026-10-26']);
+    const sql = queries.find((q) => /chat_quality/.test(q))!;
+    expect(sql).toMatch(/COALESCE\(e\.props->>'fail_reason', ''\) <> 'relay_superseded'/);
+  });
+});
+
 const PG = process.env.INSIGHTS_PG_URL;
 const maybe = PG ? describe : describe.skip;
 
@@ -105,6 +120,7 @@ maybe('сбор разговоров недели', () => {
     await pool.query(`INSERT INTO events (ts, user_id, name, props) VALUES
       ($1, '79990000001', 'chat_quality', '{"ok":false,"empty":true}'),
       ($1, '70000000000', 'chat_quality', '{"ok":false,"failed":true}'),
+      ($1, '79990000001', 'chat_quality', '{"ok":false,"empty":true,"failed":true,"fail_reason":"relay_superseded"}'),
       ($1, '79990000001', 'chat_quality', '{"ok":true}')`, [IN]);
     svc = new InsightsCollectService({ query: (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) } as any);
   });
@@ -145,7 +161,7 @@ maybe('сбор разговоров недели', () => {
     expect(out.signals).toMatchObject({ meetingsTotal: 1, meetingsFailed: 1 });
   });
 
-  it('пустые и упавшие ответы — только живых', async () => {
+  it('пустые и упавшие ответы — только живых и без перебитых под шлагбаумом', async () => {
     expect((await svc.collect(week)).signals.emptyOrFailedTurns).toBe(1);
   });
 

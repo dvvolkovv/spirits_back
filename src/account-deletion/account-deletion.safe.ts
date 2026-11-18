@@ -36,6 +36,7 @@ const DELETION_RESOURCE_TYPE_LIST = [
   'chat-upload.purge',
   'image.purge',
   'video-job.purge',
+  'video-upload.purge',
   'video.provider',
   'speech.purge',
   'listen.purge',
@@ -48,6 +49,7 @@ const DELETION_RESOURCE_TYPE_LIST = [
   'support.purge',
   'peer.stop',
   'peer.purge',
+  'contacts.stop',
   'contacts.purge',
   'referral.stop',
   'referral.purge',
@@ -564,14 +566,16 @@ export function accountDeletionWorkerEnabled(env: NodeJS.ProcessEnv): boolean {
   return ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED;
 }
 
-export function safeDeletionMessage(input: {
+interface SafeDeletionLogFields {
   deletionId: string;
   resourceType: DeletionResourceType;
   resourceKey: string;
   attempts: number;
-  kind: DeletionErrorKind;
   userId: string;
-}): string {
+}
+
+/** Технические поля журнала после проверки — общая часть safe-форм. */
+function safeDeletionLogFields(input: SafeDeletionLogFields): string {
   assertSafeResourceType(input.resourceType);
   if (typeof input.userId !== 'string' || input.userId.trim().length === 0) {
     throw new Error('unsafe_user_id');
@@ -589,8 +593,42 @@ export function safeDeletionMessage(input: {
   if (!Number.isFinite(input.attempts) || !Number.isInteger(input.attempts) || input.attempts < 0) {
     throw new Error('unsafe_attempts');
   }
+  return `deletion=${input.deletionId} type=${input.resourceType} key=${input.resourceKey} attempt=${input.attempts}`;
+}
+
+export function safeDeletionMessage(input: SafeDeletionLogFields & {
+  kind: DeletionErrorKind;
+}): string {
+  const fields = safeDeletionLogFields(input);
   if (!DELETION_ERROR_KINDS.has(input.kind)) throw new Error('unsafe_kind');
-  return `deletion=${input.deletionId} type=${input.resourceType} key=${input.resourceKey} attempt=${input.attempts} kind=${input.kind}`;
+  return `${fields} kind=${input.kind}`;
+}
+
+const SKIP_COUNT_NAME_RE = /^[a-z][a-z_]{0,31}$/;
+
+/**
+ * K4c — safe-форма УСПЕШНОГО пропуска: адаптер сознательно оставил объекты,
+ * не принадлежащие задаче (не сбой и не retry). Отличима от строк сбоя
+ * раннера: префикс `skipped` и без `kind=`, по которому оператор ищет
+ * ошибки. Технические поля проверяются так же, как в safeDeletionMessage
+ * (без userId); счётчики — только имена [a-z_] и целые ≥ 0, хотя бы один.
+ */
+export function safeDeletionSkipMessage(input: SafeDeletionLogFields & {
+  counts: Readonly<Record<string, number>>;
+}): string {
+  const fields = safeDeletionLogFields(input);
+  const counts = input.counts && typeof input.counts === 'object'
+    ? Object.entries(input.counts)
+    : [];
+  if (counts.length === 0) throw new Error('unsafe_count');
+  const parts = counts.map(([name, value]) => {
+    if (!SKIP_COUNT_NAME_RE.test(name) || typeof value !== 'number'
+      || !Number.isInteger(value) || value < 0) {
+      throw new Error('unsafe_count');
+    }
+    return `${name}=${value}`;
+  });
+  return `skipped ${fields} ${parts.join(' ')}`;
 }
 
 export function deletionErrorKind(error: any): DeletionErrorKind {

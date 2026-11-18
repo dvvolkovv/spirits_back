@@ -512,6 +512,23 @@ describe('черновики ответов в тикет', () => {
     expect(telegram.answerCallbackQuery.mock.calls[0][1]).toContain('закрыт');
   });
 
+  it('публикация в тикет удалённого аккаунта: без retry, черновик cancelled, отвечающему — причина', async () => {
+    support.postOwnerReplyFromTelegram.mockRejectedValue(new ConflictException('ticket owner account is not active'));
+
+    await drafts.handleCallback(callback());
+
+    expect(support.postOwnerReplyFromTelegram).toHaveBeenCalledWith(
+      TICKET, '111', 'u-admin', 'текст', true, 'u-admin', DRAFT, 1,
+    );
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'cancelled', 1);
+    expect(store.finalizeDraft).not.toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 1);
+    expect(store.releaseDraft).not.toHaveBeenCalled();
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith(
+      'callback-1', 'Аккаунт пользователя удалён или заблокирован — ответ не сохранён',
+    );
+  });
+
   it('при ошибке публикации callback получает ровно один безопасный ответ', async () => {
     support.postOwnerReplyFromTelegram.mockRejectedValue(new Error('секрет из ошибки'));
 

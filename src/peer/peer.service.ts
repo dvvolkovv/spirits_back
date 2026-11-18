@@ -70,6 +70,17 @@ export class PeerService implements OnModuleInit {
     if (!(await canReceiveNewProposal(this.pg, toUserId))) {
       throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
     }
+    // K6b: получатель — только активный аккаунт. Заявка удалённому (после
+    // peer.stop), заблокированному или без строки user_id висела бы pending
+    // навсегда; ответ — тот же, что на несуществующего получателя. Тот же
+    // гейт стоит в самом INSERT (получателя могут удалить между проверками).
+    const recipient = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [toUserId],
+    );
+    if ((recipient.rowCount ?? recipient.rows?.length ?? 0) === 0) {
+      throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
+    }
 
     // Target must exist
     const target = await this.pg.query('SELECT 1 FROM ai_profiles_consolidated WHERE user_id = $1', [toUserId]);
@@ -134,9 +145,12 @@ export class PeerService implements OnModuleInit {
 
     const ins = await this.pg.query(
       `INSERT INTO chat_requests (from_user_id, to_user_id, intro_message, status)
-       VALUES ($1, $2, $3, 'pending') RETURNING id`,
+       SELECT $1, $2, $3, 'pending'
+        WHERE EXISTS (SELECT 1 FROM user_id WHERE internal_id = $2 AND state = 'active')
+       RETURNING id`,
       [fromUserId, toUserId, intro],
     );
+    if (!ins.rows[0]) throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
     return { id: ins.rows[0].id, status: 'pending' };
   }
 

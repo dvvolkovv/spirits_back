@@ -50,6 +50,15 @@ describe('запрос chat_quality', () => {
     expect(sql).not.toContain("'english_leak'");
   });
 
+  it('не считает пустым ход, перебитый под шлагбаумом выката релея', async () => {
+    const { svc, queries } = makeService();
+    await svc.getOverview();
+
+    // Его текст ушёл со следующим сообщением (fail_reason relay_superseded).
+    const sql = chatQuery(queries)!.sql;
+    expect(sql).toMatch(/'empty'[^\n]*'relay_superseded'/);
+  });
+
   it('исключает удалённые аккаунты', async () => {
     const { svc, queries } = makeService();
     await svc.getOverview();

@@ -48,6 +48,9 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       user_id text PRIMARY KEY, profile_data jsonb, tokens bigint,
       email text, isadmin boolean, created_at timestamptz DEFAULT now()
     )`);
+    // K3: ответ владельца пишется, только пока аккаунт владельца тикета active.
+    await pool.query('CREATE TABLE user_id (internal_id text PRIMARY KEY, state text NOT NULL)');
+    await pool.query("INSERT INTO user_id (internal_id, state) VALUES ('u-owner', 'active')");
     const pg = {
       query: pool.query.bind(pool),
       getClient: () => pool.connect(),

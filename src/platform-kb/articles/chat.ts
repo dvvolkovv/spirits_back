@@ -5,11 +5,13 @@ import { V } from '../values';
 // источник: Маша и PDF — src/chat/chat.controller.ts:555-633
 // источник: голосовой ввод — spirits_front src/services/voiceDictation.ts; src/voice/voice-ws.ts (язык профиля, lang_unsupported); src/voice/speechkit-stt.service.ts (SPEECHKIT_LANGUAGE_CODES: без zh; speechkitLanguageCodes: к нерусскому — ru-RU)
 // источник: «Чистый лист» — src/chat/context-reset/*; src/chat/chat.service.ts (contextResetAt); spirits_front src/components/chat/contextReset.ts
-// источник: «Медиа и файлы» — spirits_front src/components/chat/files/chatFiles.ts:39-48; src/chat/chat-files/chat-files.service.ts
+// источник: «Медиа и файлы» — spirits_front src/components/chat/files/chatFiles.ts, ChatFilesPanel.tsx (загрузки, пометка, удаление); src/chat/chat-files/chat-files.service.ts (listForSession: загрузки из chat_uploads)
+// источник: комментарии к загрузкам — src/chat/chat-files/note-file.tool.ts (note_file); find_files ищет по комментарию — src/chat/chat-files/find-files.ts (scoreUpload)
+// источник: удаление загрузки — src/chat/chat-uploads/chat-uploads.controller.ts (DELETE :id, только владелец)
 // источник: карточки вопросов — src/chat/ask-rule.ts; spirits_front src/components/chat/AskCard.tsx
 // источник: что умеют ассистенты — relay-agent/server.mjs (SYSTEM_PROMPT); src/chat/chat.service.ts (YouTube)
 // источник: find_files у Маши — src/chat/chat.service.ts (allowedTools: FIND_FILES_CLI_TOOL_NAME)
-// источник: оборванный ответ — spirits_front src/components/chat/streamFailure.ts, remoteTurn.ts:66; relay-agent/server.mjs (тексты сбоя)
+// источник: оборванный ответ — spirits_front src/components/chat/streamFailure.ts, remoteTurn.ts:66; relay-agent/server.mjs (тексты сбоя); списание оборванного хода — src/chat/partial-billing.ts
 export const chat: KbArticle = {
   id: 'chat',
   title: 'Чат с ассистентом',
@@ -29,9 +31,9 @@ ${q('chat')}: список ассистентов (на телефоне — о�
 - ${q('voiceInput')} — микрофон в поле сообщения: речь на языке профиля (${q('language')}) или русском становится текстом; с китайским языком профиля пока не работает.
 - ${q('listen')} под ответом — ответ голосом (тема speech).
 - ${q('fresh')} — этот ассистент начинает с нуля, но видит профиль и ${q('business')}. Переписка остаётся; черта в ленте — откуда он помнит. На всех устройствах.
-- ${q('files')} — всё, что ассистент создал в этом чате: ${q('filesMedia')} (картинки, видео) и ${q('filesDocs')} (документы, озвучка). Загруженное человеком туда не попадает.
+- ${q('files')} — файлы чата: созданные ассистентом и загруженные человеком; ${q('filesMedia')} — картинки и видео, ${q('filesDocs')} — остальное. К загрузке ассистент оставляет комментарий и по нему находит файл в любом чате. Свою загрузку человек удаляет там же — ассистенты её больше не откроют.
 - Уточнение ассистент иногда задаёт карточкой: выбрать вариант или ${q('askCustom')} и ${q('askSubmit')}.
-- Ассистенты, кроме Маши, создают документы, презентации и PDF файлами (ссылки — после ответа), ищут в интернете и берут расшифровку видео YouTube по ссылке. Находят файлы из прошлых разговоров с любым ассистентом — это умеет и Маша.
+- Ассистенты, кроме Маши, создают документы, презентации и PDF файлами, ищут в интернете и берут расшифровку видео YouTube по ссылке. Файлы из прошлых разговоров находят все, и Маша тоже.
 
 ## Чего нельзя
 - Приложить файл, пока ассистент отвечает.
@@ -39,7 +41,7 @@ ${q('chat')}: список ассистентов (на телефоне — о�
 
 ## Если не получается
 - Ответ ещё идёт — новые сообщения ждут в очереди; после перезагрузки видно, что ассистент работает, ответ придёт сам. Через пару минут — ${q('sendAnyway')}: отправит сразу, обычно прервав прошлую работу (у Маши — нет).
-- Ответ оборвался или пришло сообщение о временном сбое — написать «продолжай»${paid('; оборванный ход не списывается')}.
+- Ответ оборвался или пришло сообщение о временном сбое — написать «продолжай»${paid('; оборванный ход оплачивается по сделанной работе')}.
 - Ассистент «забыл» разговор — возможно, нажимали ${q('fresh')}: переписка цела, выше черты; ему её не вернуть, только пересказать.
 - Файл не отправляется — проверить размер и число файлов, добавить текст задания.
 - Голосовой ввод пишет не то — проверить язык профиля (${q('language')}).

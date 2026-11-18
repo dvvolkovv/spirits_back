@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ChatService } from '../chat/chat.service';
+import { RELAY_DRAIN_DELAYS_SHORT_MS } from '../chat/relay-drain-retry';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import {
@@ -128,8 +129,13 @@ export class SpecialistJobService {
       // Консультация — путь, где ассистент реально может позвать инструмент
       // Linkeon: AgentReplyOpts.linkeonTools — явно true (в отличие от её
       // сжатия, condense() ниже, — там модель только переформулирует текст).
+      // withTimeout ход не отменяет — релей на выкате ждём коротко, чтобы
+      // генерации хватило места в JOB_TIMEOUT_MS.
       const reply = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId, { linkeonTools: true }),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId,
+          { linkeonTools: true, relayDrainDelaysMs: RELAY_DRAIN_DELAYS_SHORT_MS },
+        ),
         JOB_TIMEOUT_MS,
       );
 
@@ -240,10 +246,14 @@ export class SpecialistJobService {
     try {
       const lang = await this.language.resolveUserLanguage(userId);
       const note = VOICE_ASK_NOTE[lang] || VOICE_ASK_NOTE[DEFAULT_LANGUAGE];
+      // K1b: гейт на живой аккаунт в самом INSERT (форма saveUserMessageRow,
+      // Task 11): assertActive стоит раньше, и между ними есть await'ы.
+      // userId — последним параметром, позиции content/tokens не меняются.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-         VALUES ($1, 'human', $2, $3, 'text')`,
-        [`${userId}_${agentId}`, agentId, `${note}\n\n${question}`],
+         SELECT $1, 'human', $2, $3, 'text'
+         WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+        [`${userId}_${agentId}`, agentId, `${note}\n\n${question}`, userId],
       );
     } catch (e: any) {
       this.logger.warn(`вопрос не записан в чат agent=${agentId}: ${e?.message}`);
@@ -253,10 +263,12 @@ export class SpecialistJobService {
   /** Ответ ложится отдельной строкой — вопрос уже в чате с начала работы. */
   private async recordAnswer(userId: string, agentId: number, answer: string, tokens: number): Promise<void> {
     try {
+      // K1b: гейт — как в recordQuestion.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-         VALUES ($1, 'ai', $2, $3, 'text', $4)`,
-        [`${userId}_${agentId}`, agentId, answer, tokens],
+         SELECT $1, 'ai', $2, $3, 'text', $4
+         WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $5 AND u.state = 'active')`,
+        [`${userId}_${agentId}`, agentId, answer, tokens, userId],
       );
     } catch (e: any) {
       this.logger.warn(`ответ не записан в чат agent=${agentId}: ${e?.message}`);
@@ -272,10 +284,14 @@ export class SpecialistJobService {
       ? 'Ответ не пришёл вовремя — вопрос задавался голосом во время звонка.'
       : 'Ответить не удалось — вопрос задавался голосом во время звонка.';
     try {
+      // K1b: зовётся из catch без проверки аккаунта — сбой специалиста после
+      // удаления не должен оставлять строку в чате удалённого. Гейт — как в
+      // recordQuestion.
       await this.pg.query(
         `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-         VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-        [`${userId}_${agentId}`, agentId, text],
+         SELECT $1, 'ai', $2, $3, 'text', 0
+         WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+        [`${userId}_${agentId}`, agentId, text, userId],
       );
     } catch { /* и это не повод ронять job */ }
   }
@@ -297,8 +313,13 @@ export class SpecialistJobService {
       `ВСЛУХ: 2–3 коротких предложения, только суть и главный вывод, без списков, ` +
       `заголовков и markdown. До ${SPOKEN_ANSWER_LIMIT} символов.\n\n${answer}`;
     try {
+      // Релей на выкате не ждём вовсе: за CONDENSE_TIMEOUT_MS он может не
+      // вернуться, а брошенный withTimeout ход позже всё равно сходил бы в
+      // модель. Сразу отдаём обрезанный оригинал (ниже).
       const short = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_condense_${randomUUID()}`),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(HOST_AGENT_ID), prompt, `voice_condense_${randomUUID()}`, { relayDrainDelaysMs: [] },
+        ),
         CONDENSE_TIMEOUT_MS,
       );
       const trimmed = (short.text || '').trim();

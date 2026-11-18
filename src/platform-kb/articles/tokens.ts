@@ -3,7 +3,7 @@ import { V } from '../values';
 
 // источник: что это — spirits_front src/components/onboarding/LegalModal.tsx:131-137 (не сгорают, не возвращаются)
 // источник: где баланс — spirits_front src/components/layout/Navigation.tsx:151-191; ChatInterface.tsx:2769-2805; ProfileView.tsx:471-498
-// источник: цена ответа — src/chat/chat.service.ts:2530-2637 (по стоимости хода); категории — src/tokens/spend-category.ts:22-63
+// источник: цена ответа — src/chat/chat.service.ts:2530-2637 (по стоимости хода); оборванный ход — src/chat/partial-billing.ts; категории — src/tokens/spend-category.ts:22-63
 // источник: расход по месяцам — src/tokens/tokens.controller.ts:24-44; spirits_front src/components/tokens/SpendingSummary.tsx
 // источник: низкий баланс и ноль — src/tokens/consumption-rate.ts (LOW_BALANCE_THRESHOLD); шлагбаум нуля — по имени, не по строке (номера строк уже расходились с кодом): ChatService.streamChat (balance <= 0 → reason: 'no_tokens') и ChatController.uploadAndChat (тот же шлагбаум для хода с вложениями), оба в src/chat/; src/tokens/balance-context.service.ts (NEAR_EMPTY_ANSWERS); src/chat/no-tokens-message.ts
 // источник: поиск бесплатен — src/misc/misc.service.ts:117-256 (списания нет)
@@ -39,6 +39,6 @@ export const tokens: KbArticle = {
 - Неверное или двойное списание токенов — ${q('support')}: ИИ-поддержка проверит картинки и видео и за явный сбой вернёт токены; крупные суммы и спорные списания она передаёт команде.
 
 ## Как устроено
-Цена ответа — стоимость работы модели над ним. Ход, оборванный сбоем или новым сообщением, не оплачивается; закрытая вкладка ход не обрывает — он доводится до конца и оплачивается.
+Цена ответа — стоимость работы модели над ним. Ход, оборванный сбоем или новым сообщением, оплачивается по сделанной работе, если часть ответа или файл успели прийти; если не пришло ничего — не оплачивается. Закрытая вкладка ход не обрывает — он доводится до конца и оплачивается.
 `,
 };

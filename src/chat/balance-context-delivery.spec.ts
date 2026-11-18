@@ -1,4 +1,4 @@
-import { insufficientTokens } from './chat-tools';
+import { insufficientTokens, INSUFFICIENT_TOKENS_HINT } from './chat-tools';
 
 describe('insufficientTokens — единый ответ на нехватку токенов', () => {
   it('несёт баланс, требуемое и нехватку', () => {
@@ -18,6 +18,20 @@ describe('insufficientTokens — единый ответ на нехватку �
 
   it('нехватка не уходит в минус при балансе больше требуемого', () => {
     expect(insufficientTokens(12000, 10000).shortfall).toBe(0);
+  });
+
+  it('подсказывает выход: не повторять вызов, предложить возможное сейчас, спросить', () => {
+    const { hint } = insufficientTokens(3000, 10000);
+    expect(hint).toBe(INSUFFICIENT_TOKENS_HINT);
+    expect(hint).toContain('Не повторяй этот же вызов');
+    expect(hint).toContain('std вместо hd');
+    expect(hint).toContain('SVG');
+    expect(hint).toContain('Спроси, как продолжить');
+  });
+
+  it('в подсказке нет сумм и ссылок — их несёт блок баланса', () => {
+    expect(INSUFFICIENT_TOKENS_HINT).not.toMatch(/\d/);
+    expect(INSUFFICIENT_TOKENS_HINT).not.toMatch(/https?:|linkeon\.io/);
   });
 });
 

@@ -4,6 +4,8 @@ import * as path from 'path';
 import { Pool } from 'pg';
 import type { DeletionJobSpec } from '../account-deletion/account-deletion.types';
 import { discoverVoiceDeletion } from './voice-account-deletion.adapter';
+import { VoiceCallService } from './voice-call.service';
+import { HOST_AGENT_ID, type CompletePayload } from './voice-call.types';
 
 /**
  * Discovery voice.stop/voice.purge против живого Postgres (Task 10, follow-up
@@ -258,5 +260,334 @@ maybe('discoverVoiceDeletion против живого Postgres', () => {
       expect(job.phase).toBe('purge');
       expect(job.payload).toEqual({ callId: job.resourceKey });
     }
+  });
+});
+
+/**
+ * K1 — поздний complete() и фоновое резюме звонка после удаления аккаунта.
+ *
+ * Явное удаление стирает историю (core.immediate) один раз, повторного прохода
+ * ядра нет. Звонок, который шёл в момент DELETE /webhook/profile, после
+ * voice.stop присылает complete(): без гейта он перезаписывал транскрипт и
+ * состав участников, а фоновое резюме дописывало карточку в
+ * custom_chat_history — она жила бы вечно. Здесь SQL исполняется по-настоящему:
+ * своя схема, реальные миграции voice_calls, прод-форма custom_chat_history.
+ */
+maybe('VoiceCallService.complete после удаления аккаунта против живого Postgres', () => {
+  jest.setTimeout(30_000);
+
+  const SCHEMA = `voice_k1_${process.pid}_${Date.now()}`;
+  const USER = '79990000301';
+  const ROOM = 'voice_k1-room';
+
+  let admin: Pool;
+  let pool: Pool;
+  const issued: string[] = [];
+  const pg = {
+    query: async (sql: string, params?: unknown[]) => {
+      const res = await pool.query(sql, params as any[]);
+      issued.push(sql.replace(/\s+/g, ' ').trim());
+      return res;
+    },
+  };
+
+  beforeAll(async () => {
+    admin = new Pool({ connectionString: PG, max: 1 });
+    await admin.query(`CREATE SCHEMA ${SCHEMA}`);
+    pool = new Pool({ connectionString: PG, max: 4, options: `-c search_path=${SCHEMA}` });
+    for (const name of [
+      '001_voice_calls.sql',
+      '003_call_tokens.sql',
+      '003_voice_call_origin.sql',
+      '004_voice_call_end_reason.sql',
+      '005_voice_call_participants.sql',
+    ]) {
+      await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', name), 'utf8'));
+    }
+    // internal_id — прод-тип (001_core_schema.sql: character varying NOT NULL,
+    // UNIQUE user_id_internal_id_key), а не text: гейты сравнивают его с text-
+    // колонками и параметрами, и расхождение типов должно ловиться здесь.
+    await pool.query(`CREATE TABLE user_id (
+      internal_id character varying NOT NULL UNIQUE,
+      state text,
+      deleted_at timestamptz,
+      deletion_id uuid
+    )`);
+    // Форма — как в profile-account-deletion.pg.spec.ts (001_core_schema.sql).
+    await pool.query(`CREATE TABLE custom_chat_history (
+      id serial PRIMARY KEY,
+      session_id text NOT NULL,
+      sender_type character varying(10) NOT NULL,
+      agent integer,
+      content text NOT NULL,
+      created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+      message_type character varying(20) DEFAULT 'text'::character varying NOT NULL,
+      tokens_used integer DEFAULT 0
+    )`);
+    await pool.query(`CREATE TABLE token_consumption_tasks (
+      id serial PRIMARY KEY,
+      execution_id bigint,
+      user_id text,
+      status text,
+      agent_id integer,
+      input_tokens integer,
+      output_tokens integer,
+      tokens_to_consume integer,
+      metadata jsonb
+    )`);
+  });
+
+  afterAll(async () => {
+    await pool?.end();
+    await admin?.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
+    await admin?.end();
+  });
+
+  beforeEach(async () => {
+    issued.length = 0;
+    await pool.query('TRUNCATE voice_calls, user_id, custom_chat_history, token_consumption_tasks CASCADE');
+  });
+
+  const STAGED = [{ role: 'user', text: 'staged-реплика', ts: 1 }];
+  const payload: CompletePayload = {
+    transcript: [
+      { role: 'user', text: 'меня зовут Синтетик, я открываю пекарню', ts: 1 },
+      { role: 'assistant', text: 'понял, расскажите о планах', ts: 2 },
+    ],
+    usage: { audioInputTokens: 600, audioOutputTokens: 1200, model: 'gpt-realtime' },
+    participants: [{ name: 'Участник Синтетический', joinedAt: 1 }],
+  } as CompletePayload;
+
+  async function seed(state: 'active' | 'deleted', callStatus: string): Promise<string> {
+    await pool.query(
+      `INSERT INTO user_id (internal_id, state, deleted_at, deletion_id) VALUES ($1, $2, $3, $4)`,
+      [USER, state, state === 'deleted' ? DELETED_AT : null, state === 'deleted' ? DELETION_ID : null],
+    );
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, transcript)
+       VALUES ($1, $2, 12, $3, $4, $5::jsonb)`,
+      [id, USER, ROOM, callStatus, JSON.stringify(STAGED)],
+    );
+    return id;
+  }
+
+  function makeSvc(onSummary?: () => Promise<void>) {
+    const chat = {
+      generateAgentReply: jest.fn(async () => {
+        if (onSummary) await onSummary();
+        return 'синтетическое резюме разговора';
+      }),
+      consolidateAfterChatPublic: jest.fn(async () => {}),
+    };
+    const livekit = { userToken: jest.fn(), dispatchAgent: jest.fn(), send: jest.fn(async () => {}) };
+    const svc = new VoiceCallService(pg as any, chat as any, livekit as any);
+    return { svc, chat };
+  }
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  async function waitIssued(re: RegExp, timeoutMs = 5_000): Promise<void> {
+    const until = Date.now() + timeoutMs;
+    while (!issued.some((s) => re.test(s))) {
+      if (Date.now() > until) throw new Error(`не дождались запроса ${re}`);
+      await sleep(20);
+    }
+  }
+
+  async function callRow(id: string) {
+    return (await pool.query(
+      `SELECT status, transcript, participants, summary FROM voice_calls WHERE id = $1`,
+      [id],
+    )).rows[0];
+  }
+  async function historyCount(): Promise<number> {
+    return (await pool.query(`SELECT count(*)::int AS n FROM custom_chat_history`)).rows[0].n;
+  }
+
+  it('удалённый аккаунт: complete не перезаписывает транскрипт и участников, карточки и консолидации нет', async () => {
+    // voice.stop уже пометил звонок interrupted и закрыл комнату — воркер шлёт complete.
+    const id = await seed('deleted', 'interrupted');
+    const { svc, chat } = makeSvc();
+
+    await svc.complete(id, payload);
+    // Фоновому резюме (если оно запущено) — время дойти до записи.
+    await sleep(300);
+
+    const row = await callRow(id);
+    expect(row.transcript).toEqual(STAGED);
+    expect(row.participants).toBeNull();
+    expect(row.summary).toBeNull();
+    expect(row.status).toBe('interrupted');
+    expect(await historyCount()).toBe(0);
+    expect(chat.consolidateAfterChatPublic).not.toHaveBeenCalled();
+  });
+
+  it('удалённый аккаунт: повторный complete не создаёт второй строки учёта', async () => {
+    const id = await seed('deleted', 'interrupted');
+    const { svc } = makeSvc();
+
+    await svc.complete(id, payload);
+    await svc.complete(id, payload);
+    await sleep(300);
+
+    const n = (await pool.query(`SELECT count(*)::int AS n FROM token_consumption_tasks`)).rows[0].n;
+    expect(n).toBeLessThanOrEqual(1);
+  });
+
+  // Решение владельца 17.11 (вариант A): аккаунт удалён до завершения звонка —
+  // complete() учёт не пишет вовсе: ни строки token_consumption_tasks ни по
+  // звонку, ни по пользователю, и повторный complete тоже. След расходов
+  // остаётся только в warn (тесты «warn несёт стоимость…» ниже). Оба исхода:
+  // voice.stop успел пометить звонок interrupted — или удаление пришло, пока
+  // звонок ещё active.
+  async function billingRows(id: string) {
+    return (await pool.query(
+      `SELECT user_id, status, metadata FROM token_consumption_tasks
+        WHERE user_id = $1 OR metadata->>'callId' = $2`,
+      [USER, id],
+    )).rows;
+  }
+
+  it.each(['interrupted', 'active'])(
+    'вариант A: удалённый аккаунт (звонок %s) — complete не пишет учёт, повтор тоже',
+    async (callStatus) => {
+      const id = await seed('deleted', callStatus);
+      const { svc } = makeSvc();
+
+      await svc.complete(id, payload);
+      await svc.complete(id, payload);
+      await sleep(300);
+
+      expect(await billingRows(id)).toEqual([]);
+      expect((await pool.query(`SELECT count(*)::int AS n FROM token_consumption_tasks`)).rows[0].n).toBe(0);
+    },
+  );
+
+  // Контроль к варианту A: тот же запрос billingRows находит строку учёта
+  // живого звонка — пустой ответ выше значит «учёта нет», а не «запрос мимо».
+  it('вариант A, контроль: активный аккаунт — ровно одна строка учёта этого звонка', async () => {
+    const id = await seed('active', 'active');
+    const { svc } = makeSvc();
+
+    await svc.complete(id, payload);
+    await svc.complete(id, payload); // повтор идемпотентен: статус уже completed
+    await waitIssued(/INSERT INTO custom_chat_history/);
+
+    const rows = await billingRows(id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ user_id: USER, status: 'pending' });
+    expect(rows[0].metadata).toMatchObject({ kind: 'voice_call', callId: id });
+  });
+
+  it('аккаунт удалён, пока считалось резюме: карточки в ленте и summary нет', async () => {
+    const id = await seed('active', 'active');
+    const { svc } = makeSvc(async () => {
+      await pool.query(
+        `UPDATE user_id SET state = 'deleted', deleted_at = $2, deletion_id = $3 WHERE internal_id = $1`,
+        [USER, DELETED_AT, DELETION_ID],
+      );
+    });
+
+    await svc.complete(id, payload);
+    await waitIssued(/INSERT INTO custom_chat_history/);
+
+    expect(await historyCount()).toBe(0);
+    expect((await callRow(id)).summary).toBeNull();
+  });
+
+  it('активный аккаунт: транскрипт, участники, резюме и карточка пишутся как раньше', async () => {
+    const id = await seed('active', 'active');
+    const { svc, chat } = makeSvc();
+
+    await svc.complete(id, payload);
+    await waitIssued(/INSERT INTO custom_chat_history/);
+
+    const row = await callRow(id);
+    expect(row.status).toBe('completed');
+    expect(row.transcript).toEqual(payload.transcript);
+    expect(row.participants).toEqual([{ name: 'Участник Синтетический', joinedAt: 1 }]);
+    expect(row.summary).toBe('синтетическое резюме разговора');
+    const card = (await pool.query(
+      `SELECT session_id, sender_type, agent, content FROM custom_chat_history`,
+    )).rows;
+    expect(card).toHaveLength(1);
+    expect(card[0].session_id).toBe(`${USER}_${HOST_AGENT_ID}`);
+    expect(card[0].sender_type).toBe('ai');
+    expect(card[0].content).toContain(`{{voice_call: id=${id}}}`);
+    expect(card[0].content).toContain('синтетическое резюме разговора');
+    expect(chat.consolidateAfterChatPublic).toHaveBeenCalledTimes(1);
+    const billing = (await pool.query(`SELECT user_id, status FROM token_consumption_tasks`)).rows;
+    expect(billing).toEqual([{ user_id: USER, status: 'pending' }]);
+  });
+
+  // K1b (ревью K1): для удалённого аккаунта строка «кончился» не должна
+  // появляться — звонок не завершён записью; а след расходов (стоимость и
+  // длительность) остаётся в warn, пока учёт удалённым не пишется. Без PII.
+  it('удалённый аккаунт: «кончился» не пишется, warn несёт стоимость и длительность без идентификатора', async () => {
+    const id = await seed('deleted', 'interrupted');
+    const { svc } = makeSvc();
+    const log = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await svc.complete(id, payload);
+
+    const logged = log.mock.calls.map((c) => String(c[0]));
+    expect(logged.filter((m) => /кончился/.test(m))).toEqual([]);
+    const warned = warn.mock.calls.map((c) => String(c[0])).filter((m) => /аккаунт неактивен/.test(m));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatch(/cost=\$\d+\.\d{4}/);
+    expect(warned[0]).toMatch(/\b\d+s\b/);
+    expect(warned[0]).not.toContain(USER);
+  });
+
+  // Ревью K1b: коды отключения (raw) нужны для разбора и PII не несут —
+  // в warn удалённого они те же, что в «кончился» у живого.
+  it('удалённый аккаунт: warn несёт коды отключения, без идентификатора', async () => {
+    const id = await seed('deleted', 'interrupted');
+    const { svc } = makeSvc();
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await svc.complete(id, { ...payload, ending: { disconnect: 'room_deleted', close: 'participant_disconnected' } });
+
+    const warned = warn.mock.calls.map((c) => String(c[0])).filter((m) => /аккаунт неактивен/.test(m));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('room_deleted|participant_disconnected');
+    expect(warned[0]).not.toContain(USER);
+  });
+
+  it('активный аккаунт: «кончился» пишется как раньше', async () => {
+    const id = await seed('active', 'active');
+    const { svc } = makeSvc();
+    const log = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+
+    await svc.complete(id, payload);
+    await waitIssued(/INSERT INTO custom_chat_history/);
+
+    expect(log.mock.calls.map((c) => String(c[0])).filter((m) => /кончился/.test(m))).toHaveLength(1);
+  });
+
+  // K1b: воркер сбрасывает растущий транскрипт через progress() ~раз в 15 с,
+  // и после voice.stop (status 'interrupted') условие status <> 'completed'
+  // его пропускало — разговор удалённого продолжал дописываться в строку.
+  it('удалённый аккаунт: progress не дописывает транскрипт и участников', async () => {
+    const id = await seed('deleted', 'interrupted');
+    const { svc } = makeSvc();
+
+    await svc.progress(id, payload.transcript, payload.participants);
+
+    const row = await callRow(id);
+    expect(row.transcript).toEqual(STAGED);
+    expect(row.participants).toBeNull();
+  });
+
+  it('активный аккаунт: progress стейджит транскрипт и участников как раньше', async () => {
+    const id = await seed('active', 'active');
+    const { svc } = makeSvc();
+
+    await svc.progress(id, payload.transcript, payload.participants);
+
+    const row = await callRow(id);
+    expect(row.transcript).toEqual(payload.transcript);
+    expect(row.participants).toEqual([{ name: 'Участник Синтетический', joinedAt: 1 }]);
   });
 });

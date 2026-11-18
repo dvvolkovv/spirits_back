@@ -28,6 +28,13 @@ import { labelsFor } from '../platform-kb/labels';
 import type { KbClient } from '../platform-kb/kb.types';
 import { EventsService } from '../events/events.service';
 
+/**
+ * K3: отказ записать ответ поддержки — аккаунт владельца тикета не active
+ * (удалён или заблокирован). По этому тексту alert-bot отличает отказ от сбоя
+ * и отвечает в Telegram причиной, а не уводит черновик в retry.
+ */
+export const TICKET_OWNER_INACTIVE = 'ticket owner account is not active';
+
 export class TicketPrefixAmbiguousError extends Error {
   override readonly name = 'TicketPrefixAmbiguousError';
 
@@ -1261,7 +1268,26 @@ ${healthSummary}
         }
       }
 
-      await this.insertMessage(ticketId, 'owner', senderId, content, metadata, visibleToUser, client);
+      // K3: ответ пишется, только пока аккаунт ВЛАДЕЛЬЦА тикета active. Гейт —
+      // в самом INSERT (форма K1b/Task 11), владелец берётся из тикета: у
+      // Telegram-пути проверки не было вовсе, у adminReply она стоит отдельным
+      // запросом до транзакции, и удаление между ними проходило. Отказ — до
+      // любой записи (сообщение, SLA, событие reply, письмо): throw → ROLLBACK.
+      // Параметры — в порядке insertMessage, гейт ссылается только на $1.
+      const inserted = await client.query(
+        `INSERT INTO support_messages (ticket_id, sender_type, sender_id, content, metadata, visible_to_user)
+         SELECT $1, $2, $3, $4, $5::jsonb, $6
+          WHERE EXISTS (SELECT 1 FROM support_tickets t
+                          JOIN user_id u ON u.internal_id = t.user_id
+                         WHERE t.id = $1 AND u.state = 'active')
+         RETURNING id`,
+        [ticketId, 'owner', senderId, content, metadata ? JSON.stringify(metadata) : null, visibleToUser],
+      );
+      if (!inserted.rows[0]) throw new ConflictException(TICKET_OWNER_INACTIVE);
+      await client.query(
+        `UPDATE support_tickets SET last_message_at = now(), updated_at = now() WHERE id = $1`,
+        [ticketId],
+      );
       if (visibleToUser) {
         await client.query(
           `UPDATE support_tickets

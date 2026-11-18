@@ -18,7 +18,6 @@ import { jobCostRefunded } from './job-refund';
 import {
   assertFetchableMedia,
   fetchMediaBytes,
-  ownStaticPath,
   publicDir as ownPublicDir,
 } from '../common/net/own-media';
 import {
@@ -41,6 +40,37 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+
+/**
+ * Каталог личных загрузок пользователя в видео-бакете — фото, которые человек
+ * загрузил для ролика (uploadUserAsset). Одна функция и для записи, и для
+ * обхода при удалении аккаунта (video-upload.purge): формат ключа не
+ * разъедется. Завершающий '/' обязателен — без него префикс 7999000050
+ * захватил бы и каталог 79990000501.
+ */
+export function videoUploadPrefix(userId: string): string {
+  return `video-uploads/${userId}/`;
+}
+
+/**
+ * K4b — сколько ссылок строки video_jobs на объекты своего видео-бакета
+ * purge сознательно НЕ удалил (не принадлежат задаче или её владельцу).
+ * Только счётчики: ни ключей, ни userId — их адаптер пишет в журнал.
+ */
+export interface VideoPurgeSkips {
+  /** Ключ своего бакета вне белого списка: чужая загрузка, shorts/…, чужая задача. */
+  notOwned: number;
+  /** Хвост URL, не прошедший ownedObjectKeyOrThrow (traversal, пустой сегмент…). */
+  unsafeKey: number;
+}
+
+/**
+ * K4c — потолок страниц обхода video-uploads/<userId>/ (по 1000 ключей —
+ * до 10 млн объектов на пользователя). Честный листинг столько не даёт:
+ * упор в потолок — рассогласование MinIO (бесконечная череда новых токенов),
+ * retry external_unknown вместо вечного цикла.
+ */
+export const VIDEO_UPLOADS_MAX_LIST_PAGES = 10_000;
 
 /** Предел одного референс-фото Veo — и для внешней ссылки, и для загрузки пользователя. */
 const VEO_PORTRAIT_MAX_BYTES = 12 * 1024 * 1024;
@@ -344,16 +374,38 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private static readonly SAFE_DELETION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
   /**
+   * Job-scoped формы ключей видео-бакета — производные одной задачи:
+   * videos/<jobId>.jpg — превью (extractAndUploadThumbnail);
+   * videos/<jobId>.mp4 — прежний ролик в бакете (его же стирает deleteS3Objects).
+   */
+  private static deletionJobMinioKeys(jobId: string): string[] {
+    return [`videos/${jobId}.mp4`, `videos/${jobId}.jpg`];
+  }
+
+  /**
    * Строгое стирание video job при удалении аккаунта.
    *
    * В отличие от deleteJob (пользовательский flow, best-effort allSettled),
-   * purge подтверждает КАЖДЫЙ owned объект до удаления row: MinIO-объекты
-   * (производные videos/<id>.mp4|jpg + video-uploads/<userId>/… и прочие own
-   * URL, прочитанные ИЗ СОХРАНЁННОЙ строки — не из payload), локальный
-   * финальный MP4/JPG и staging _veoconcat — только через checked own paths
-   * (валидный id + ownStaticPath, escape/symlink-выход бросает). Ошибки не
+   * purge подтверждает КАЖДЫЙ owned объект до удаления row. Ошибки не
    * подавляются: неподтверждённый исход — retry, row и технические id
    * (kling_task_id) переживают попытку.
+   *
+   * K4b — удаляется только то, что принадлежит ЭТОЙ задаче или её владельцу.
+   * Ссылки в колонках строки (video_url, thumbnail_url, source_image_url,
+   * audio_url) — данные, а не право на удаление: source_image_url присылает
+   * пользователь, и на проде там встречаются video-uploads/<ДРУГОЙ>/….
+   * Белый список MinIO (свой бакет): производные ключи задачи
+   * (deletionJobMinioKeys — удаляются всегда) и личные загрузки владельца
+   * под videoUploadPrefix(userId). Прочий ключ своего бакета (чужая
+   * загрузка, shorts/…, производный ключ другой задачи) и хвост, не прошедший
+   * ownedObjectKeyOrThrow, — не удаляются и задачу не роняют (иначе чужая
+   * ссылка держала бы purge в вечном retry); счётчики пропусков уходят в
+   * onSkipped после успешного удаления row. Чужой бакет, /static и внешние
+   * URL из колонок не трогаются вовсе. Локальные файлы — только производные
+   * от id строки (deletionLocalVideoPaths): финальный MP4/JPG и staging
+   * _veoconcat; путь из URL строки не строится. composed_plan
+   * (veo_reference_images) здесь не читается — личные загрузки под своим
+   * префиксом целиком стирает video-upload.purge.
    *
    * Несуществующий объект/файл — подтверждённое отсутствие (успех). Нет row —
    * успех (идемпотентный повтор). Omni interaction id — НЕ deletable файл:
@@ -366,8 +418,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     userId: string,
     videoJobId: string,
     deletionId: string,
+    onSkipped?: (skips: VideoPurgeSkips) => void,
   ): Promise<void> {
-    if (!VideoService.SAFE_DELETION_ID_RE.test(videoJobId)) {
+    // userId — seed префикса личных загрузок (та же проверка, что у
+    // deleteVideoUploadsForDeletion); videoJobId — seed производных путей.
+    if (typeof userId !== 'string' || !VideoService.SAFE_DELETION_ID_RE.test(userId)
+      || typeof videoJobId !== 'string' || !VideoService.SAFE_DELETION_ID_RE.test(videoJobId)) {
       throw new DeletionRetryError('db');
     }
     const res = await this.pg.query(
@@ -382,29 +438,39 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const row = res.rows[0];
     if (!row) return;
 
-    // Сначала собираем ВСЕ цели (escape в URL бросает до первого удаления),
-    // затем удаляем строго по одной с await — без allSettled.
-    const minioKeys = new Set<string>([`videos/${videoJobId}.mp4`, `videos/${videoJobId}.jpg`]);
-    const localFiles = new Set<string>();
-    const localDirs = new Set<string>();
-    const derived = this.deletionLocalVideoPaths(videoJobId);
-    derived.files.forEach((f) => localFiles.add(f));
-    derived.dirs.forEach((d) => localDirs.add(d));
+    // Производные пути и ключи — только из id САМОЙ строки (она совпала по id
+    // и user_id этого пользователя), с повторной проверкой алфавита.
+    const jobId = String(row.id);
+    if (!VideoService.SAFE_DELETION_ID_RE.test(jobId)) {
+      throw new DeletionRetryError('db');
+    }
+
+    // Сначала собираем ВСЕ цели, затем удаляем строго по одной с await —
+    // без allSettled.
+    const jobKeys = VideoService.deletionJobMinioKeys(jobId);
+    const minioKeys = new Set<string>(jobKeys);
+    const ownUploads = videoUploadPrefix(userId);
+    const skips: VideoPurgeSkips = { notOwned: 0, unsafeKey: 0 };
+    const derived = this.deletionLocalVideoPaths(jobId);
+    const localFiles = new Set<string>(derived.files);
+    const localDirs = new Set<string>(derived.dirs);
 
     const minioPrefix = this.s3PublicUrl('');
     for (const raw of [row.video_url, row.thumbnail_url, row.source_image_url, row.audio_url]) {
       const url = String(raw ?? '').trim();
-      if (!url) continue;
-      if (url.startsWith(minioPrefix)) {
-        // video-uploads/<userId>/… и прочие own-ключи читаются из сохранённой
-        // row; префикс ЧУЖОГО бакета (assets, chat-files) не совпадает — их
-        // объекты принадлежат своим каноническим строкам.
-        minioKeys.add(ownedObjectKeyOrThrow(url.slice(minioPrefix.length)));
+      // Только ключи СВОЕГО бакета. Чужой бакет (assets, chat-files) — объекты
+      // своих строк; /static и внешние URL — не цель (локальные файлы задачи
+      // выведены из jobId выше).
+      if (!url || !url.startsWith(minioPrefix)) continue;
+      let key: string;
+      try {
+        key = ownedObjectKeyOrThrow(url.slice(minioPrefix.length));
+      } catch {
+        skips.unsafeKey += 1;
         continue;
       }
-      const own = ownStaticPath(url); // escape за public/ бросает UnsafeUrlError
-      if (own) localFiles.add(own.file);
-      // Внешний provider URL — не наш объект.
+      if (jobKeys.includes(key) || key.startsWith(ownUploads)) minioKeys.add(key);
+      else skips.notOwned += 1;
     }
 
     for (const key of minioKeys) await this.deleteVideoMinioConfirmed(key);
@@ -446,6 +512,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     } finally {
       client.release();
     }
+    if (onSkipped && (skips.notOwned > 0 || skips.unsafeKey > 0)) onSkipped(skips);
   }
 
   /**
@@ -478,6 +545,81 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   private async deleteVideoMinioConfirmed(key: string): Promise<void> {
     if (!this.storage) throw new DeletionRetryError('external_unknown');
     await this.storage.deleteConfirmed({ bucket: this.s3Bucket, key });
+  }
+
+  /**
+   * K4 — личные загрузки video-uploads/<userId>/ при удалении аккаунта.
+   *
+   * uploadUserAsset кладёт фото ДО и НЕЗАВИСИМО от строки video_jobs: фото
+   * могло не дойти до задачи, cleanupOldFailedJobs стирает failed-строки, не
+   * трогая объекты, а 2-е и 3-е референс-фото Veo живут только в
+   * composed_plan, не в колонках строки. deleteVideoForDeletion такие объекты
+   * не видит, поэтому весь каталог владельца листается постранично
+   * (ListObjectsV2 с continuation token) и каждый объект удаляется
+   * подтверждённо (deleteConfirmed). С удалением по строке обход пересекается
+   * только подтверждённым отсутствием — порядок между ними не важен.
+   *
+   * Fail-closed:
+   *  - userId проверяется ДО построения префикса (алфавит SAFE_DELETION_ID_RE —
+   *    тот же, что SAFE_DELETION_USER_RE аватаров: телефон или uuid, без '/',
+   *    пробелов и управляющих символов, ≤128): пустой userId дал бы префикс
+   *    всего каталога загрузок — retry db без единого обращения к MinIO;
+   *  - без StorageService — retry external_unknown (как deleteVideoMinioConfirmed);
+   *  - поколение проверяется до первого листинга: аккаунт оживили —
+   *    DeletionCancelledError;
+   *  - ключ вне префикса в ответе листинга или усечённая страница без нового
+   *    токена — retry external_unknown, а не тихий успех с хвостом;
+   *  - K4c: токен, уже встречавшийся в этом обходе (повтор подряд или цикл
+   *    A→B→A), и упор в VIDEO_UPLOADS_MAX_LIST_PAGES — тоже external_unknown,
+   *    а не вечный цикл.
+   * beforeDelete (адаптер передаёт ctx.assertCurrent) зовётся перед каждым
+   * удалением — форма chat-upload.purge. Повтор после частичного сбоя
+   * идемпотентен: стёртое листинг больше не вернёт, пустой каталог — успех.
+   * Ключи и userId здесь не логируются: журнал пишет раннер, safe-формами.
+   */
+  async deleteVideoUploadsForDeletion(
+    userId: string,
+    deletionId: string,
+    beforeDelete: () => Promise<void> = async () => undefined,
+  ): Promise<void> {
+    if (typeof userId !== 'string' || !VideoService.SAFE_DELETION_ID_RE.test(userId)) {
+      throw new DeletionRetryError('db');
+    }
+    const storage = this.storage;
+    if (!storage) throw new DeletionRetryError('external_unknown');
+    const gen = await this.pg.query(
+      `SELECT 1 FROM user_id u
+        WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+      [userId, deletionId],
+    );
+    if ((gen.rowCount ?? 0) === 0) throw new DeletionCancelledError();
+
+    const prefix = videoUploadPrefix(userId);
+    const seenTokens = new Set<string>();
+    let token: string | undefined;
+    for (let pages = 1; ; pages += 1) {
+      const page = await storage.listPage({
+        bucket: this.s3Bucket,
+        prefix,
+        continuationToken: token,
+      });
+      // Вся страница проверяется до первого удаления: чужой ключ в ответе —
+      // рассогласование транспорта, удалять по нему нельзя.
+      if (page.keys.some((key) => !key.startsWith(prefix))) {
+        throw new DeletionRetryError('external_unknown');
+      }
+      for (const key of page.keys) {
+        await beforeDelete();
+        await storage.deleteConfirmed({ bucket: this.s3Bucket, key });
+      }
+      if (!page.truncated) return;
+      const next = page.nextContinuationToken;
+      if (!next || seenTokens.has(next) || pages >= VIDEO_UPLOADS_MAX_LIST_PAGES) {
+        throw new DeletionRetryError('external_unknown');
+      }
+      seenTokens.add(next);
+      token = next;
+    }
   }
 
   // ================= POLLER =================
@@ -703,7 +845,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
     const extMatch = origName.match(/\.([a-z0-9]{2,5})$/i);
     const ext = extMatch ? extMatch[1].toLowerCase() : 'jpg';
-    const key = `video-uploads/${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const key = `${videoUploadPrefix(userId)}${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     await this.ensureBucket();
     await this.s3.send(new PutObjectCommand({
       Bucket: this.s3Bucket,

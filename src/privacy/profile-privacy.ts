@@ -245,10 +245,22 @@ export async function canUseProfileForRequester(
   }
 }
 
+/**
+ * K6b: кандидаты поиска — только активные аккаунты (state='active'; нет
+ * строки user_id — не кандидат). Удалённый, у которого core упал и профиль
+ * ещё не обнулён (окно до повтора), иначе выдавал бы в поиск имя и ценности.
+ * Внутренний JOIN, а не EXISTS: план с материализованными парами не
+ * меняется. Для readProfileAccessBatch (списки контактов) фильтра нет — там
+ * строки истории удалённого остаются, телефон гейтит contacts.
+ */
+const ACTIVE_CANDIDATE_JOIN =
+  `JOIN user_id u ON u.internal_id = p.user_id AND u.state = 'active'`;
+
 async function searchAccessRows(
   pg: PrivacyPg,
   requesterId: string,
   candidateIds: string[] | null,
+  activeOnly: boolean,
 ): Promise<SearchAccessRow[]> {
   const result = await pg.query(
     `WITH me AS (
@@ -291,6 +303,7 @@ async function searchAccessRows(
        (pp.user_id IS NOT NULL) AS peer,
        (bp.user_id IS NOT NULL) AS blocked
      FROM ai_profiles_consolidated p
+     ${activeOnly ? ACTIVE_CANDIDATE_JOIN : ''}
      LEFT JOIN approved_contact_pairs acp ON acp.profile_id = p.id
      LEFT JOIN peer_pairs pp ON pp.user_id = p.user_id
      LEFT JOIN block_pairs bp ON bp.user_id = p.user_id
@@ -328,7 +341,7 @@ export async function readProfileAccessBatch(
   const result = new Map<string, ProfileAccess>();
   if (targetIds.length === 0) return result;
 
-  const rows = await searchAccessRows(pg, requesterId, [...new Set(targetIds)]);
+  const rows = await searchAccessRows(pg, requesterId, [...new Set(targetIds)], false);
   for (const row of rows) {
     let settings: PrivacySettings;
     try {
@@ -378,7 +391,7 @@ export async function listSearchCandidateIds(
   pg: PrivacyPg,
   requesterId: string,
 ): Promise<Set<string>> {
-  return searchableRows(await searchAccessRows(pg, requesterId, null));
+  return searchableRows(await searchAccessRows(pg, requesterId, null, true));
 }
 
 export async function filterSearchCandidateIds(
@@ -387,5 +400,5 @@ export async function filterSearchCandidateIds(
   candidateIds: string[],
 ): Promise<Set<string>> {
   if (candidateIds.length === 0) return new Set<string>();
-  return searchableRows(await searchAccessRows(pg, requesterId, candidateIds));
+  return searchableRows(await searchAccessRows(pg, requesterId, candidateIds, true));
 }

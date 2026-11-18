@@ -18,7 +18,9 @@ import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
-import { INTERRUPTED_TURN_NOTE } from './interrupted-turn';
+import { INTERRUPTED_TURN_NOTE, relayUndeliveredNote, RelayCarry } from './interrupted-turn';
+import { postRelayWithDrainRetry, RELAY_DRAIN_DELAYS_MS, DrainRetryOpts, RelayDrainingError, logRelayDrainOutcome } from './relay-drain-retry';
+import { BlockJoiner } from './block-separator';
 import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
 import { legacyGreetingReply } from './legacy-greeting';
 import { CRISIS_RULE } from './crisis-rule';
@@ -31,6 +33,9 @@ import { ClientPing, startClientPing } from './client-ping';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { WORK_RULES } from './work-rules';
+import { resultRules } from './result-rules';
+import { chatFailureText } from './chat-failure-texts';
+import { BillingDecision, TurnDelivery, billingDecision } from './partial-billing';
 import { relaySessionKey } from './relay-session';
 import { afterReset } from './context-reset/after-reset';
 import { ChatContextResetService } from './context-reset/context-reset.service';
@@ -83,6 +88,8 @@ export interface UploadHandoff {
   products: { products_token: string; products_mcp_url: string };
   linkeon: LinkeonRelayFields;
   profilingBlocks: RelayProfilingBlocks;
+  /** Язык человека — для текстов сбоев хода с файлом (chat-failure-texts.ts). */
+  userLanguage: string;
 }
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -124,6 +131,11 @@ export interface ChargeFacts {
   taken?: ChargeTaken;
   durationMs: number;
   replyChars: number;
+  /**
+   * Списано за оборванный ход — причина обрыва из done.failReason
+   * (partial-billing.ts, решение владельца 17.11.2026). Нет поля — обычный ход.
+   */
+  partial?: string;
 }
 
 /** turn — счёт CLI за ход, floor — страховка (доля формулы), usage — формула целиком. */
@@ -321,6 +333,15 @@ export interface AgentReplyOpts {
   includeUserContext?: boolean;
   testMode?: boolean;
   billingContext?: string;
+  /**
+   * Своё расписание повторов под шлагбаумом выката релея (relay-drain-retry.ts)
+   * для этого вызова. `[]` — не ждать: на первом 502/503 сразу
+   * RelayDrainingError(superseded = false). По умолчанию — расписание сервиса
+   * (relayDrainDelaysMs). Нужно вызовам под собственным коротким таймаутом:
+   * withTimeout ход не отменяет, и без своего бюджета брошенный ход после
+   * выката всё равно сходил бы в модель.
+   */
+  relayDrainDelaysMs?: readonly number[];
 }
 
 export interface AgentReplyOutcome {
@@ -347,7 +368,9 @@ const ROUTINE_SESSION_WAIT_MS = 30 * 60 * 1000;
  */
 export class RelaySessionBusyError extends Error {
   constructor(public readonly relaySid: string) {
-    super(`relay session busy: ${relaySid}`);
+    // relaySid — в свойстве, не в тексте: в ключе сессии номер телефона, а
+    // текст ошибки уходит в журналы.
+    super('relay session busy');
     this.name = 'RelaySessionBusyError';
   }
 }
@@ -449,10 +472,10 @@ export class ChatService {
   private readonly activeTurns = new Map<string, number>();
 
   /**
-   * Запрос хода ЧЕЛОВЕКА к релею в полёте — по ключу сессии (relaySid =
-   * relaySessionKey(...)), метка того же устройства, что у activeTurns
-   * (openTurn/closeTurn), но другой ключ и другое назначение: по этой карте
-   * решается, пре-эмптит ли входящая реплика чужой ход на релее
+   * Запрос хода к релею (человека или фонового) в полёте — по ключу сессии
+   * (relaySid = relaySessionKey(...)), метка того же устройства, что у
+   * activeTurns (openTurn/closeTurn), но другой ключ и другое назначение: по
+   * этой карте решается, пре-эмптит ли входящая реплика чужой ход на релее
    * (interrupted-turn.ts), а не «идёт ли ход у пары» для кабинета.
    *
    * «В полёте» — шире, чем «процесс на релее прямо сейчас существует»: окно
@@ -477,16 +500,138 @@ export class ChatService {
    * обычного хода той же пары, как и у ходов до и после точки, relaySid
    * разные, и прерывание одного не задевает другой (находки ревью Б2 Step 6).
    *
-   * Слепая зона: agentReply (рутины, «Путь», план действий, итоги звонков,
-   * проба качества) считает relaySid той же формулой и пишет в ТУ ЖЕ сессию
-   * релея, что и обычный чат, но эту карту не трогает вовсе — своего
-   * beginRelayRun/endRelayRun у него нет. Сообщение человека, пришедшее во
-   * время такого фонового хода, не увидит «тот ход прерван», хотя на релее
-   * произойдёт именно это (общий sessionId). Не находка: фоновые ходы
-   * короче, чем решается человек на следующую реплику, и коллизии с ними
-   * пока не видели.
+   * Фоновые ходы. agentReply (рутины, «Путь», план действий, итоги звонков,
+   * проба качества) пишет в ТУ ЖЕ сессию релея, что и обычный чат. С 05.11
+   * ход основной сессии берёт здесь свою метку и отказывается от занятой
+   * сессии (RelaySessionBusyError) — так он не перебивает человека. Ход,
+   * который ждёт релей за шлагбаумом выката (relay-drain-retry.ts), метку
+   * сохраняет: следующее сообщение по-прежнему перебивает его, но вместо
+   * «тот ход прерван» получает relayUndeliveredNote с текстом и файлами
+   * ждущего — см. relayWaiting ниже. Фоновый ждущий ход (carry = null)
+   * заметки не даёт: его промпт человек не писал. А пока фоновый ход ИДЁТ
+   * (не ждёт), следующее сообщение человека по-прежнему получает «тот ход
+   * прерван», хотя тот ход начинал не человек, — так было и раньше, принято.
    */
   private readonly relayRunning = new Map<string, number>();
+
+  /**
+   * Ход, который ждёт релей за шлагбаумом выката (relay-drain-retry.ts), — по
+   * relaySid, с меткой того же хода, что в relayRunning. Ставится только в
+   * onRetry, то есть после первого 502/503: пока идёт первая попытка и пока
+   * читается поток, ход считается идущим, и следующее сообщение получает
+   * «тот ход прерван». carry — текст и имена файлов ждущего хода человека;
+   * у фонового хода (agentReply) — null: его промпт человек не писал.
+   * Снимается в finally postRelayTurn — и при успехе, и при отказе.
+   */
+  private readonly relayWaiting = new Map<string, { mark: number; carry: RelayCarry | null }>();
+  /** Расписание повторов под шлагбаумом; тесты подменяют. */
+  relayDrainDelaysMs: readonly number[] = RELAY_DRAIN_DELAYS_MS;
+  relayDrainSleep: ((ms: number) => Promise<void>) | undefined = undefined;
+
+  markRelayWaiting(relaySid: string, mark: number, carry: RelayCarry | null): void {
+    this.relayWaiting.set(relaySid, { mark, carry });
+  }
+
+  clearRelayWaiting(relaySid: string, mark: number): void {
+    if (this.relayWaiting.get(relaySid)?.mark === mark) this.relayWaiting.delete(relaySid);
+  }
+
+  /**
+   * Ждущие ходы, чей перенос новый ход уже забрал (relayCarryFor,
+   * relayCarryNote, relayPendingNote), — ключ `${relaySid}#${mark}`: метки —
+   * Date.now() и монотонны только внутри своей сессии. По этой отметке
+   * перебитый ход знает, ушёл ли его текст с новым ходом (postRelayTurn).
+   * Снимается в finally postRelayTurn вместе с relayWaiting.
+   */
+  private readonly relayCarryTaken = new Set<string>();
+
+  /**
+   * POST /chat к релею с повтором под шлагбаумом. Ход сдаётся как перебитый
+   * (RelayDrainingError.superseded), как только метку его сессии забрал новый
+   * ход и тот унёс его сообщение (relayCarryFor) — ход кончается молча.
+   *
+   * Окно гонки: новый ход мог прочитать состояние сессии ДО того, как этот
+   * встал в ожидание (первый POST ещё в полёте, или новый ход начался посреди
+   * него), — и переноса не получил. Тогда текст этого хода не ушёл ни к
+   * модели, ни с новым ходом, и молча кончаться нельзя: до шлагбаума человек
+   * хотя бы видел «Ошибка запуска». Такой ход сдаётся как «не доставлено»
+   * (superseded = false) — веб и загрузка покажут заглушку «ассистент
+   * обновляется — отправьте ещё раз» без списания. Фоновый ход (carry = null)
+   * остаётся перебитым: agentReply превратит это в «сессия занята», и рутина
+   * повторится.
+   *
+   * delaysMs — своё расписание вызова (AgentReplyOpts.relayDrainDelaysMs);
+   * без него — расписание сервиса.
+   */
+  async postRelayTurn<T>(
+    relaySid: string,
+    mark: number,
+    carry: RelayCarry | null,
+    makePost: () => Promise<T>,
+    delaysMs?: readonly number[],
+  ): Promise<T> {
+    const key = `${relaySid}#${mark}`;
+    const opts: DrainRetryOpts = {
+      delaysMs: delaysMs ?? this.relayDrainDelaysMs,
+      sleep: this.relayDrainSleep,
+      shouldStop: () => this.relayRunning.get(relaySid) !== mark,
+      onRetry: (attempt, delayMs) => {
+        this.markRelayWaiting(relaySid, mark, carry);
+        // Без relaySid: в ключе сессии номер телефона (журналы — без номеров).
+        this.logger.warn(`релей обновляется или недоступен — повтор ${attempt} через ${delayMs} мс`);
+      },
+    };
+    try {
+      return await postRelayWithDrainRetry(makePost, opts);
+    } catch (e) {
+      if (e instanceof RelayDrainingError && e.superseded && carry !== null && !this.relayCarryTaken.has(key)) {
+        // lastRefusal — дальше, в журнал и телеметрию: выкат или авария релея.
+        throw new RelayDrainingError(false, e.attempts, e.lastRefusal);
+      }
+      throw e;
+    } finally {
+      this.clearRelayWaiting(relaySid, mark);
+      this.relayCarryTaken.delete(key);
+    }
+  }
+
+  /**
+   * carry ждущего хода — только если ждёт именно текущий ход сессии. Отдал
+   * carry — отметил ход в relayCarryTaken: его текст теперь несёт новый ход.
+   */
+  private waitingCarry(relaySid: string): RelayCarry | null {
+    const w = this.relayWaiting.get(relaySid);
+    if (!w || !w.carry || w.mark !== this.relayRunning.get(relaySid)) return null;
+    this.relayCarryTaken.add(`${relaySid}#${w.mark}`);
+    return w.carry;
+  }
+
+  /** Своё сообщение хода плюс недошедшее ждущего — то, что новый ход несёт с собой. */
+  relayCarryFor(relaySid: string, own: RelayCarry): RelayCarry {
+    const c = this.waitingCarry(relaySid);
+    if (!c) return own;
+    return {
+      message: [c.message, own.message].filter(Boolean).join('\n\n'),
+      files: [...c.files, ...own.files],
+    };
+  }
+
+  /** Заметка о недошедшем сообщении для загрузки (у неё нет «тот ход прерван»). */
+  relayCarryNote(relaySid: string): string {
+    const c = this.waitingCarry(relaySid);
+    return c ? relayUndeliveredNote(c) : '';
+  }
+
+  /** Заметка текстовому ходу: «тот ход прерван», «не дошло» или ничего. */
+  private relayPendingNote(relaySid: string): string {
+    const running = this.relayRunning.get(relaySid);
+    if (running === undefined) return '';
+    if (this.relayWaiting.get(relaySid)?.mark !== running) return INTERRUPTED_TURN_NOTE;
+    // Ждёт текущий ход сессии: человеку — «не дошло» (и отметка о переносе),
+    // фоновому — ничего.
+    const c = this.waitingCarry(relaySid);
+    return c ? relayUndeliveredNote(c) : '';
+  }
 
   /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
   getActiveStreamCount(): number {
@@ -948,6 +1093,11 @@ export class ChatService {
     // префикса остаётся кэшируемым.
     stablePrefix += `${WORK_RULES}\n\n`;
 
+    // Правила сдачи результата (result-rules.ts; «Затыки недели» 16.11.2026) —
+    // сразу за правилами работы с файлами и тоже до профиля. У магазинной
+    // сборки правило 4 — без цены и баланса (Apple 3.1.1).
+    stablePrefix += `${resultRules({ store: opts.storeBuild === true })}\n\n`;
+
     // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
     //
     // Они меняются, но не от хода к ходу: профиль пополняется консолидацией
@@ -1011,9 +1161,10 @@ export class ChatService {
     }
 
     // Сторож размера: stablePrefix уходит релею ОДНИМ аргументом CLI (предел
-    // 128 КБ на аргумент) — WORK_RULES держит свой бюджет (≤ 6 КБ,
-    // work-rules.spec.ts), но персона ассистента, коллеги, профиль и
-    // бизнес-карточка вместе могут раздуть префикс незаметно, по кускам.
+    // 128 КБ на аргумент) — WORK_RULES и resultRules держат свои бюджеты (≤ 6 КБ
+    // каждый, work-rules.spec.ts и result-rules.spec.ts), но персона ассистента,
+    // коллеги, профиль и бизнес-карточка вместе могут раздуть префикс
+    // незаметно, по кускам.
     // 100 000 — заранее, с запасом до предела. В лог — только метрика (длина,
     // agentId, признак custom), без текста самого промпта: в нём профиль и
     // бизнес-карточка пользователя.
@@ -1215,7 +1366,7 @@ export class ChatService {
     // Инструменты Linkeon и папка хода — те же, что у текстового хода этой сессии.
     const linkeon = linkeonRelayFields(userId, sessionId);
 
-    return { baseSessionId, sessionId, systemPrompt, history, uploadContext, products, linkeon, profilingBlocks };
+    return { baseSessionId, sessionId, systemPrompt, history, uploadContext, products, linkeon, profilingBlocks, userLanguage };
   }
 
   /** Последняя проверка непосредственно перед multipart `fd.append` контроллера. */
@@ -1351,18 +1502,22 @@ export class ChatService {
         res.setHeader('X-Accel-Buffering', 'no');
         res.setHeader('Access-Control-Allow-Origin', '*');
 
+        // K1b: обе вставки gated на живой аккаунт в самом SQL — как
+        // saveUserMessageRow (Task 11); userId — последним параметром.
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-           VALUES ($1, 'human', $2, $3, 'text')`,
-          [chatSessionId, agent.id, message],
+           SELECT $1, 'human', $2, $3, 'text'
+           WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+          [chatSessionId, agent.id, message, userId],
         );
         // Адрес входа уезжает в карточку только у Zoom: у остальных площадок
         // он выводится из кода, и дублировать его в теге незачем.
         const card = buildMeetingCard(room.code, room.title, meetingLink.provider, meetingLink.url);
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-           VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-          [chatSessionId, agent.id, card],
+           SELECT $1, 'ai', $2, $3, 'text', 0
+           WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+          [chatSessionId, agent.id, card, userId],
         );
 
         res.write(JSON.stringify({ type: 'begin' }) + '\n');
@@ -2162,9 +2317,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // проверка !fresh не нужна — эту роль уже играет сравнение по relaySid;
     // старая проверка по activeTurns + !fresh путала оба случая (находки
     // ревью Б2 Step 6: копия файлов, чистый лист, разные языковые сессии).
-    if (!probe && this.relayRunning.has(relaySid)) {
-      contextPrefix += `${INTERRUPTED_TURN_NOTE}\n\n`;
-    }
+    // Если прошлый ход этой сессии не прерван, а ждёт релей за шлагбаумом
+    // выката, — вместо «тот ход прерван» заметка о недошедшем
+    // (relayUndeliveredNote), и его текст этот ход несёт с собой (relayCarry).
+    const pending = probe ? '' : this.relayPendingNote(relaySid);
+    if (pending) contextPrefix += `${pending}\n\n`;
+    const relayCarry = probe ? null : this.relayCarryFor(relaySid, { message, files: [] });
 
     // Требование языка — ПОСЛЕ всех дописанных блоков, перед самой репликой.
     //
@@ -2205,6 +2363,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
+    // Текст МОДЕЛИ, ушедший человеку (delta/text/result), — без служебных
+    // реплик релея (notice), ссылок на файлы и дописок бэка (маркеры,
+    // карточки). По нему решается, было ли что списывать за оборванный ход, и
+    // считается длина для запасного пути списания (partial-billing.ts).
+    let modelText = '';
     // M4: хвост карточки продукта, который успел дописать обычный путь (см.
     // «Карточки продуктов, заведённые этим ходом» ниже), ДО того, как апстрим
     // упал уже после него. Без этой памятки catch-ветка чистит ОБЪЕДИНЁННЫЙ
@@ -2282,9 +2445,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const answerRoute = await resolveAnswerProvider(probe, userId, this.llmProvider);
     // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
     // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
-    // Такой ход не тарифицируется — платить за пустоту пользователь не должен.
-    // Расход перед Anthropic при этом реален, поэтому частота таких ходов уезжает
-    // в chat_quality: рост — это счёт, который мы оплачиваем в одиночку.
+    // С 17.11.2026 (решение владельца) такой ход списывается по фактическому
+    // расходу, если человек успел что-то получить — текст модели или файл, — и
+    // причина из PARTIAL_BILLED_REASONS (partial-billing.ts). Сбой, после
+    // которого не пришло ничего, не тарифицируется. Для мониторинга ход в любом
+    // случае неудачный: частота таких ходов уезжает в chat_quality (failed,
+    // fail_reason, partial_billed) — несписанный расход мы оплачиваем в одиночку.
     let turnFailed = false;
     let failReason = '';
     // Чем ответил релей (done.provider/fallback) — в chat_quality.
@@ -2301,6 +2467,38 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // флага не попадает — здесь, в обычном завершении, туда уходит fullText
     // (пустая строка), заглушка живёт только в этом aiText для истории.
     let selfHealSkippedForTakeover = false;
+    // Заглушка в историю, когда повтор под шлагбаумом исчерпан. В fullText не
+    // идёт — ход не тарифицируется и не учит профиль.
+    let failureStub = '';
+    // Последний отказ релея у хода, так и не дошедшего до него
+    // (RelayDrainingError.lastRefusal): '503' — выкат, '502'/'ECONNREFUSED' —
+    // авария. В chat_quality рядом с fail_reason relay_draining/relay_superseded.
+    let relayRefusal: string | undefined;
+
+    // Решение о списании и сумма — одно правило на ход (turnChargeFor,
+    // partial-billing.ts): его читают и индикатор «N токенов» в `end`, и
+    // persistResponse; разойдись они — человек увидел бы одно, а списалось бы
+    // другое. Замыкание только собирает данные хода: зовётся по итогам потока,
+    // когда turnFailed, текст модели и файлы хода уже известны. Текст для
+    // решения — из chunks, а не fullText persistResponse: тот подменяет отказ
+    // CLI заглушкой, а turnBilling узнаёт отказ именно по исходному тексту.
+    // chargeText — текст для запасного пути обычного хода, свой у каждого места.
+    //
+    // Известное расхождение: поток упал уже ПОСЛЕ done и ушёл в главный catch —
+    // клиент видит в `end` 0, а persistResponse спишет оборванный ход (partial).
+    // Тот же класс, что у успешного хода, упавшего после done (там в `end` тоже
+    // 0, а списание — за весь ход); в коде не чиним.
+    const chargeFor = (chargeText: string) => this.turnChargeFor(
+      {
+        text: this.stripLeakedToolSyntax(chunks.join('').trim()),
+        chargeText,
+        failed: turnFailed,
+        failReason,
+        modelText,
+        files: pendingFiles.length,
+      },
+      agentUsage, agentCostUsd, agentTurnCost.usd,
+    );
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -2322,12 +2520,33 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // дословно и тем более за него заплатить: в истории 70005550003 лежат
       // «You've hit your session limit · resets 11:50am (UTC)» и «Not logged in ·
       // Please run /login», выданные как реплики ассистента и стоившие токенов.
+      //
+      // cliRefusal — для метки журнала: отказ, узнанный по тексту, —
+      // cli_fatal_text, какую бы причину ни прислал релей (turnBilling решает
+      // так же). failReason для chat_quality остаётся релейным.
+      let cliRefusal = false;
       if (this.looksCliFailure(fullText)) {
         this.logger.error(`CLI-отказ долетел до бэкенда как ответ (${userId}_${assistantId}): ${fullText.slice(0, 120)}`);
         turnFailed = true;
         failReason = failReason || 'cli_fatal_text';
-        fullText = '_Не получилось: временный сбой на стороне платформы. Токены за этот ход не списаны — попробуйте отправить сообщение ещё раз._';
+        cliRefusal = true;
+        fullText = chatFailureText('cliFatal', userLanguage, { storeBuild });
       }
+      // Решение о списании и сумма — то же, что ушло в индикатор `end`
+      // (chargeFor выше): отказ CLI решение узнаёт само, по исходному тексту из
+      // chunks. Исключение — поток, упавший после done (см. у chargeFor): там в
+      // `end` ушёл 0, а здесь оборванный ход спишется. Текст обычного хода для
+      // запасного пути здесь — очищенный fullText, у индикатора — сырой
+      // chunks.join(''): давнее различие, оставлено как есть. Считается здесь,
+      // до chat_quality: partial_billed берёт ту же сумму, что уходит в
+      // списание ниже.
+      //
+      // Решение владельца 17.11.2026: оборванный ход, после которого человек
+      // что-то получил, списывается по фактическому расходу — billing[partial:…].
+      // Сбой без ответа не выставляется (textCost 0). Расход перед Anthropic всё
+      // равно понесён, поэтому пишем его в лог явно: иначе «бесплатные» ходы
+      // станут невидимой статьёй затрат.
+      const { billing, charge, tokens: textCost } = chargeFor(fullText);
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
         // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
@@ -2347,6 +2566,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
             lang_mismatch: this.looksLanguageMismatch(fullText, userLanguage, message),
             failed: turnFailed,
             fail_reason: failReason || undefined,
+            // Оборванный ход, списанный за пришедшее (partial-billing.ts): для
+            // мониторинга он по-прежнему failed, а списание видно здесь. Флаг —
+            // «действительно списано»: при нулевой сумме (одни файлы, а в done ни
+            // usage, ни стоимости) строки списания нет — нет и флага.
+            partial_billed: billing.partial && textCost > 0 ? true : undefined,
+            relay_refusal: relayRefusal,
             provider: turnProvider,
             fallback: turnFallback || undefined,
             selected: routed ? answerRoute.provider : undefined,
@@ -2363,20 +2588,22 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // If we have actual content — save it.
       // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
       // (Frontend will reload history; user can simply resend.)
-      const aiText = fullText
-        || (final && !selfHealSkippedForTakeover ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
+      // Заглушка шлагбаума в истории — всегда, даже за текстом хода (хвост
+      // карточки продукта): иначе человек не узнал бы, что сообщение надо
+      // отправить ещё раз.
+      const aiText = failureStub
+        ? [fullText, failureStub].filter(Boolean).join('\n\n')
+        : fullText || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage, { storeBuild }) : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
-      // путь показа считает то же самое, дублировать в лог незачем.
-      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd);
-      // Ход без финального ответа пользователю не выставляется — решение владельца.
-      // Расход перед Anthropic всё равно понесён, поэтому пишем его в лог явно:
-      // иначе «бесплатные» ходы станут невидимой статьёй затрат.
-      const textCost = turnFailed ? 0 : charge.tokens;
-      const logLine = turnFailed
-        ? `billing[skipped:${failReason}]: ход без финального ответа — не тарифицирован, ` +
+      // путь показа считает то же самое, дублировать в лог незачем. Сумма —
+      // charge/textCost выше, до chat_quality.
+      const logLine = !billing.billable
+        ? `billing[skipped:${cliRefusal ? 'cli_fatal_text' : failReason}]: ход без финального ответа — не тарифицирован, ` +
           `иначе списали бы ${charge.tokens} (${charge.note})`
-        : `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
+        : billing.partial
+          ? `billing[partial:${billing.partial}:${charge.source}]: tokens=${textCost} ${charge.note}`
+          : `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
       if (turnFailed || charge.source === 'length') this.logger.warn(logLine);
       else this.logger.log(logLine);
 
@@ -2385,7 +2612,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // смотреть логи руками — сам по себе такой ход ничем себя не обозначает.
       // fire-and-forget — алерт не должен влиять на списание.
       //
-      // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
+      // Сравниваем charge.tokens, а не textCost: у несписанного сбоя textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
       await this.alertExpensiveTurn(userId, assistantId, charge, textCost);
 
@@ -2414,10 +2641,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
           await this.saveChatHistory(userId, assistantId, message, aiText, textCost, sessOverride);
         }
         if (fullText.length > 0) {
-          // Списание — только за ход, доведённый до финального ответа. Обучение
-          // профиля и разбор задач идут в любом случае: оборванный ход всё равно
-          // был настоящим разговором, и терять из него контекст незачем.
-          if (!turnFailed) {
+          // Списание — за ход с ответом, в том числе оборванный, если человек
+          // успел что-то получить (billing.billable, partial-billing.ts).
+          // Обучение профиля и разбор задач идут в любом случае: оборванный ход
+          // всё равно был настоящим разговором, и терять из него контекст незачем.
+          //
+          // Оборванный ход с нулевым расходом (одни файлы, а в done ни usage, ни
+          // стоимости) строку не пишет: планировщик (TokenAccountingService)
+          // поднял бы 0 до минимума в 1 токен, а индикатор и история показали 0.
+          // Обычный ход — как раньше.
+          if (billing.billable && (textCost > 0 || !billing.partial)) {
             const turnCostUsd = agentTurnCost.usd;
             await this.addTokenTask(userId, 0, textCost, agentId, {
               costUsd: Number(agentCostUsd.toFixed(4)),
@@ -2426,11 +2659,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
               taken: charge.taken,
               durationMs: Date.now() - streamStartTime,
               replyChars: fullText.length,
+              ...(billing.partial ? { partial: billing.partial } : {}),
             });
             // Страховка сработала на ЗАПИСАННОМ списании — релей, похоже, ошибся.
             this.alertTurnCostFloor(userId, assistantId, charge, textCost);
             // Сторож роста стоимости: ход за ходом дороже — алерт. Только здесь,
-            // за записанным списанием: пустой ответ, оборванный ход и сбой
+            // за записанным списанием: пустой ответ, несписанный сбой и сбой
             // записи истории до списания не доходят — значит, и до сторожа.
             // Не ждём: ход от него не зависит.
             void this.costGrowth?.recordTurn(
@@ -2439,18 +2673,21 @@ ${LanguageService.buildDirective(userLanguage)}`;
               { balance: () => this.getTokenBalance(userId) },
             );
           }
+          // Ход, не дождавшийся релея (failureStub), разговором не был: в
+          // fullText разве что хвост карточки — учить по нему нечему.
+          const learn = !failureStub;
           // Профиль формируется всегда, и у пинга (fresh) тоже. Ход после точки
           // «Чистого листа» — обычный разговор: точка скрывает от ассистента
           // старый контекст, но не выключает обучение профиля и разбор задач.
-          if (this.neo4j) {
+          if (this.neo4j && learn) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
           }
           // Задачи из fresh-разговора (пинг) не извлекаем — без побочных задач.
           // turnAt — момент хода, а не этой записи после ответа: см. streamChat.
-          if (this.tasksService && !fresh) {
+          if (this.tasksService && !fresh && learn) {
             try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText, turnAt); } catch {}
           }
-          if (this.businessProfile && !fresh) {
+          if (this.businessProfile && !fresh && learn) {
             try { await this.businessProfile.extractFromTurn(userId, assistantId, message, fullText); } catch {}
           }
         }
@@ -2502,53 +2739,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // fs_key и activity должны соответствовать фактической сессии попытки,
       // включая смену режима на self-heal retry.
       let linkeonFields = linkeonRelayFields(userId, relaySid);
-      const callUpstreamOnce = async (attempt: { sessionId: string; systemPrompt: string }): Promise<void> => {
+      const callUpstreamOnce = async (attempt: { sessionId: string; systemPrompt: string }, mark: number): Promise<void> => {
         const attemptLinkeonFields = linkeonRelayFields(userId, attempt.sessionId);
         linkeonFields = attemptLinkeonFields;
-        const FormData = require('form-data');
-        const fd = new FormData();
-        fd.append('message', prompt);
-        // Стабильная часть — в --system-prompt релея, отправляется один раз на
-        // сессию и кэшируется. История — отдельным полем: релей вставит её
-        // только если стартует без --resume. Старый релей оба поля игнорирует
-        // и продолжает работать, поэтому выкатывать надо СНАЧАЛА релей: в
-        // обратном порядке персона исчезнет из промпта и ассистенты начнут
-        // представляться Claude.
-        if (attempt.systemPrompt) fd.append('systemPrompt', attempt.systemPrompt);
-        if (historyBlock) fd.append('history', historyBlock);
-        // relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
-        // Claude-сессию — прежний id протащил бы прошлый разговор мимо любых
-        // наших фильтров. Поэтому чистую память после точки «Чистого листа»
-        // даёт метка точки в ключе релея (relay-session.ts), а у пинга
-        // мониторинга (fresh) — своя одноразовая сессия.
-        // Язык — часть ключа сессии.
-        //
-        // Релей резюмит Claude-сессию по sessionId и тащит в неё весь прежний
-        // разговор. У человека, сменившего язык, накопленная русская переписка
-        // перевешивала любые указания в промпте: три правки подряд не помогли,
-        // ассистент отвечал «Рад снова тебя видеть» по-русски аккаунту с
-        // language=en. Другой язык — другая сессия, чистая память, никакого
-        // русского образца перед глазами.
-        //
-        // Цена: при смене языка ассистент забывает прежний разговор. Это
-        // честнее, чем отвечать не на том языке, а история в нашей БД
-        // сохраняется и показывается пользователю как была.
-        fd.append('sessionId', attempt.sessionId);
-
-        // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
-        // не требует Opus, а обвязка Claude Code (системный промпт CLI +
-        // определения MCP-тулов, ~47k токенов) грузится независимо от содержания
-        // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku.
-        //
-        // Боевые ходы с 23.09.2026 называют модель явно (common/chat-model.ts),
-        // а не полагаются на 'default' релея. Поле по-прежнему необязательное и
-        // деградирует безопасно в обе стороны: старый релей его игнорирует, а
-        // релей с белым списком, где нашего значения ещё нет, подставит свой
-        // 'default'. В обоих случаях ход проходит — просто пин не действует,
-        // и узнать об этом можно только по modelUsage, не по ошибке.
-        fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
-        for (const [k, v] of Object.entries(relayProviderFields(probe, answerRoute.provider))) fd.append(k, v);
-
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
         // point at (staging vs api.talerid.io). The file-agent injects a per-session
@@ -2556,11 +2749,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // stays on the backend-mediated card flow). Not connected → fields omitted →
         // agent runs exactly as today.
         const tid = await this.taleridAgentFields(userId);
-        if (tid) {
-          fd.append('talerid_token', tid.token);
-          fd.append('talerid_mcp_url', tid.mcpUrl);
-        }
-
         // Инструмент продуктов. Владелец едет ПОДПИСЬЮ в заголовке, а не
         // подсказкой в промпте: телефоном в аргументе правились бы чужие сайты.
         // Тот же токен открывает справку: язык, клиент и вид ассистента едут в
@@ -2571,19 +2759,79 @@ ${LanguageService.buildDirective(userLanguage)}`;
           agent: agentId.startsWith('custom:') ? 'custom' : 'staff',
           turn: productsTurn,
         });
-        fd.append('products_token', pf.products_token);
-        fd.append('products_mcp_url', pf.products_mcp_url);
-        // Инструменты Linkeon (mcp__linkeon__*): пользователь — в подписи
-        // токена, а не в аргументе, который пишет модель; папка хода — fs_key.
-        appendLinkeonFields(fd, attemptLinkeonFields);
+        // Форма multipart — поток: второй раз её не отправить, поэтому на каждый
+        // повтор под шлагбаумом — новая (relay-drain-retry.ts).
+        const buildForm = () => {
+          const FormData = require('form-data');
+          const fd = new FormData();
+          fd.append('message', prompt);
+          // Стабильная часть — в --system-prompt релея, отправляется один раз на
+          // сессию и кэшируется. История — отдельным полем: релей вставит её
+          // только если стартует без --resume. Старый релей оба поля игнорирует
+          // и продолжает работать, поэтому выкатывать надо СНАЧАЛА релей: в
+          // обратном порядке персона исчезнет из промпта и ассистенты начнут
+          // представляться Claude.
+          if (attempt.systemPrompt) fd.append('systemPrompt', attempt.systemPrompt);
+          if (historyBlock) fd.append('history', historyBlock);
+          // relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
+          // Claude-сессию — прежний id протащил бы прошлый разговор мимо любых
+          // наших фильтров. Поэтому чистую память после точки «Чистого листа»
+          // даёт метка точки в ключе релея (relay-session.ts), а у пинга
+          // мониторинга (fresh) — своя одноразовая сессия.
+          // Язык — часть ключа сессии.
+          //
+          // Релей резюмит Claude-сессию по sessionId и тащит в неё весь прежний
+          // разговор. У человека, сменившего язык, накопленная русская переписка
+          // перевешивала любые указания в промпте: три правки подряд не помогли,
+          // ассистент отвечал «Рад снова тебя видеть» по-русски аккаунту с
+          // language=en. Другой язык — другая сессия, чистая память, никакого
+          // русского образца перед глазами.
+          //
+          // Цена: при смене языка ассистент забывает прежний разговор. Это
+          // честнее, чем отвечать не на том языке, а история в нашей БД
+          // сохраняется и показывается пользователю как была.
+          fd.append('sessionId', attempt.sessionId);
 
-        const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
-          headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-          responseType: 'stream',
-          timeout: RELAY_TURN_BUDGET_MS,
-          maxRedirects: 0,
+          // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
+          // не требует Opus, а обвязка Claude Code (системный промпт CLI +
+          // определения MCP-тулов, ~47k токенов) грузится независимо от содержания
+          // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku.
+          //
+          // Боевые ходы с 23.09.2026 называют модель явно (common/chat-model.ts),
+          // а не полагаются на 'default' релея. Поле по-прежнему необязательное и
+          // деградирует безопасно в обе стороны: старый релей его игнорирует, а
+          // релей с белым списком, где нашего значения ещё нет, подставит свой
+          // 'default'. В обоих случаях ход проходит — просто пин не действует,
+          // и узнать об этом можно только по modelUsage, не по ошибке.
+          fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
+          for (const [k, v] of Object.entries(relayProviderFields(probe, answerRoute.provider))) fd.append(k, v);
+
+          if (tid) {
+            fd.append('talerid_token', tid.token);
+            fd.append('talerid_mcp_url', tid.mcpUrl);
+          }
+
+          fd.append('products_token', pf.products_token);
+          fd.append('products_mcp_url', pf.products_mcp_url);
+          // Инструменты Linkeon (mcp__linkeon__*): пользователь — в подписи
+          // токена, а не в аргументе, который пишет модель; папка хода — fs_key.
+          appendLinkeonFields(fd, attemptLinkeonFields);
+          return fd;
+        };
+
+        const agentRes = await this.postRelayTurn(attempt.sessionId, mark, relayCarry, () => {
+          const fd = buildForm();
+          return axios.post(`${AGENT_URL}/chat`, fd, {
+            headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+            responseType: 'stream',
+            timeout: RELAY_TURN_BUDGET_MS,
+            maxRedirects: 0,
+          });
         });
 
+        // Шаг работы (tool) между кусками текста: первый кусок после него
+        // получает разделитель (block-separator.ts), иначе «файл.Готово».
+        const joiner = new BlockJoiner(() => chunks.join(''));
         await new Promise<void>((resolve, reject) => {
           let buffer = '';
           agentRes.data.on('data', (chunk: Buffer) => {
@@ -2598,8 +2846,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
                   const ev = JSON.parse(line.slice(6));
 
                   if (ev.type === 'delta' || ev.type === 'text') {
-                    chunks.push(ev.text);
-                    safeWrite({ type: 'item', content: ev.text });
+                    const text = joiner.text(ev.text);
+                    chunks.push(text);
+                    // Текст модели — отдельно от служебных реплик (partial-billing.ts).
+                    if (typeof text === 'string') modelText += text;
+                    safeWrite({ type: 'item', content: text });
                   } else if (ev.type === 'notice' && ev.text) {
                     // Служебная реплика платформы («ответ прерван», «упёрлись в
                     // лимит шагов»). В отличие от `result` — дописывается ВСЕГДА.
@@ -2609,9 +2860,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     // ровно в том случае, ради которого они и написаны. Поэтому
                     // оборванный ответ выглядел как молчание: пользователь читал
                     // «Вношу группу А.» и тишину, а потом слал «?».
-                    chunks.push(ev.text);
-                    safeWrite({ type: 'item', content: ev.text });
+                    const text = joiner.text(ev.text);
+                    chunks.push(text);
+                    safeWrite({ type: 'item', content: text });
                   } else if (ev.type === 'tool') {
+                    joiner.tool();
                     // Шаг работы для клиента, который его рисует (activity-map.ts).
                     // В chunks не идёт: к тексту ответа отношения не имеет.
                     if (ui.activity) {
@@ -2621,6 +2874,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                   } else if (ev.type === 'result' && ev.text) {
                     if (chunks.length === 0) {
                       chunks.push(ev.text);
+                      modelText += String(ev.text);
                       safeWrite({ type: 'item', content: ev.text });
                     }
                   } else if (ev.type === 'done') {
@@ -2676,7 +2930,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           relaySid = attempt.sessionId;
           relayMark = this.beginRelayRun(relaySid);
         }
-        await callUpstreamOnce(attempt);
+        await callUpstreamOnce(attempt, relayMark);
       };
       try {
         await runUpstreamAttempt();
@@ -2704,7 +2958,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Проверка takeover — внутри runUpstreamAttempt после свежего
           // consent-query: новый ход мог перехватить сессию и за эту паузу, и за
           // сам запрос настроек. При смене режима метка переедет на новый ключ.
-          try { await runUpstreamAttempt(true); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+          try {
+            await runUpstreamAttempt(true);
+          } catch (e: any) {
+            // Шлагбаум выката — не «повтор не удался»: исход решает главный catch.
+            if (e instanceof RelayDrainingError) throw e;
+            this.logger.warn(`self-heal retry failed: ${e.message}`);
+          }
         }
       } finally {
         this.endRelayRun(relaySid, relayMark);
@@ -2934,9 +3194,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Fallback нужен, если релей ещё старой сборки и costUsd не шлёт —
       // иначе ход стал бы бесплатным.
       // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
-      // Число для индикатора «X токенов». Считается тем же методом, что и реальное
-      // списание в persistResponse, — иначе юзер увидит одно, а спишется другое.
-      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd).tokens;
+      // Число для индикатора «X токенов». Считается тем же правилом (chargeFor →
+      // turnChargeFor), что и реальное списание в persistResponse, — иначе юзер
+      // увидит одно, а спишется другое. Сбой, за который не списали, — 0;
+      // оборванный ход — по видимому тексту модели.
+      // Текст обычного хода здесь — сырой chunks.join(''), в persistResponse —
+      // очищенный fullText: давнее различие, оставлено как есть.
+      const tokensUsed = chargeFor(fullText).tokens;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
@@ -2998,7 +3262,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Async persist — dedup via `saved` flag with the catch-path persist.
       setImmediate(() => { void persistResponse(true); });
     } catch (err) {
-      this.logger.error(`Universal agent proxy error: ${err.message}`);
+      if (err instanceof RelayDrainingError) {
+        // Шлагбаум выката — штатный исход, не сбой; 502/ECONNREFUSED до конца
+        // бюджета — авария релея, error (logRelayDrainOutcome).
+        logRelayDrainOutcome(this.logger, err);
+        relayRefusal = err.lastRefusal === undefined ? undefined : String(err.lastRefusal);
+      } else {
+        this.logger.error(`Universal agent proxy error: ${err.message}`);
+      }
       // Апстрим мог упасть ПОСЛЕ done (ev.outputFiles уже разобран синхронно
       // обработчиком `data`, ошибка пришла дальше по тому же потоку) — файлы
       // хода всё равно надо скопировать и дописать ссылкой, иначе их потерял
@@ -3035,7 +3306,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
           const joined = chunks.join('');
           const cleaned = stripProductActionBlocks(joined);
           if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
-          const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
+          // Ход под шлагбаумом выката до релея не дошёл: свои карточки (если их
+          // завёл первый прогон self-heal) найдутся по метке хода. Запасной
+          // путь по времени с начала хода за минуты ожидания подобрал бы только
+          // чужие — заведённые другим ходом того же человека, — поэтому since = сейчас.
+          const since = err instanceof RelayDrainingError ? new Date() : new Date(streamStartTime);
+          const taken = (await this.productActions?.takeForTurn(userId, productsTurn, since, 'web')) ?? [];
           const tail = productActionTail(taken, ui.cards, userLanguage);
           if (tail) {
             chunks.push(tail);
@@ -3046,9 +3322,40 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.warn(`product action attach failed in catch: ${e.message}`);
       }
       // Try to write error to response; safeWrite is a no-op if client gone.
-      const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
-      safeWrite({ type: 'item', content: errText });
-      safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
+      if (err instanceof RelayDrainingError && err.superseded) {
+        // Ход ждал релей за шлагбаумом, и его перебило новое сообщение: оно
+        // уже несёт текст этого хода (relayCarryFor). Тихий конец — без
+        // заглушки и без строки ассистента в истории.
+        // Своя метка, не 'preempted': ответ не потерян, а придёт со следующим
+        // ходом, — алерт пустых ответов такие ходы не считает.
+        turnFailed = true;
+        failReason = 'relay_superseded';
+        selfHealSkippedForTakeover = true;
+        safeWrite({ type: 'end', content: '', reason: 'superseded', usage: { input: 0, output: 0, total: 0 } });
+      } else if (err instanceof RelayDrainingError) {
+        // Релей обновлялся дольше бюджета повтора. Токены не списаны: причина
+        // relay_draining — вне PARTIAL_BILLED_REASONS (partial-billing.ts), а
+        // заглушка не в fullText.
+        turnFailed = true;
+        failReason = 'relay_draining';
+        failureStub = chatFailureText('relayUpdating', userLanguage, { storeBuild });
+        // Перед заглушкой мог уйти хвост карточки своего хода (её завёл первый
+        // прогон self-heal): без пустой строки заглушка прилипла бы к
+        // закрывающему ``` блока. В end — тот же текст, что ляжет в историю
+        // (persistResponse склеивает их так же).
+        const before = this.stripLeakedToolSyntax(chunks.join('').trim());
+        safeWrite({ type: 'item', content: before ? '\n\n' + failureStub : failureStub });
+        safeWrite({
+          type: 'end',
+          content: [before, failureStub].filter(Boolean).join('\n\n'),
+          reason: 'relay_draining',
+          usage: { input: 0, output: 0, total: 0 },
+        });
+      } else {
+        const errText = chatFailureText('startFailed', userLanguage);
+        safeWrite({ type: 'item', content: errText });
+        safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
+      }
       if (!clientDisconnected) {
         try { res.end(); } catch {}
       }
@@ -3318,8 +3625,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // multipart.
     const resetAt = sessionIdOverride ? null : await this.contextResetAt(userId, assistantId);
 
-    // Последний await перед multipart: consent и ключ выбираются уже после
-    // resolveAnswerProvider, чтобы отзыв во время маршрутизации не ушёл на релей.
+    // Consent проверяется один раз перед отправкой — последним await перед
+    // multipart: consent и ключ выбираются уже после resolveAnswerProvider,
+    // чтобы отзыв во время маршрутизации не ушёл на релей. Пока ход ждёт релей
+    // за шлагбаумом выката (до ~149 с), подготовленный префикс уходит
+    // повторно как есть — так же, как в ходе человека.
     // Изолированная проба без контекста не читает profile_data по её контракту.
     const dispatchProfilingAllowed = opts.testMode === true && opts.includeUserContext === false
       ? true
@@ -3335,29 +3645,33 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const baseRelaySid = sessionIdOverride || relaySessionKey(userId, assistantId, userLanguage, undefined, resetAt);
     const relaySid = relaySessionForProfiling(baseRelaySid, dispatchProfilingAllowed);
 
-    const FormData = require('form-data');
-    const fd = new FormData();
     const outboundPrompt = opts.testMode === true ? neutralizeAtMentions(prompt) : prompt;
     const outboundStablePrefix = opts.testMode === true
       ? neutralizeAtMentions(dispatchStablePrefix)
       : dispatchStablePrefix;
-    fd.append('message', outboundPrompt);
-    if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
-    fd.append('sessionId', relaySid);
-    for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
-    if (opts.testMode === true) fd.append('testMode', 'true');
-    // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
-    // true (см. AgentReplyOpts); по умолчанию — нет.
-    //
-    // fs_key — не инструмент, а имя папки хода, и уходит всегда (спека
-    // 2026-11-02-pii-out-of-prompts-design.md, п. 3): без него релей называет
-    // папку по ключу сессии — у проверки версии ассистента это base64 с
-    // номером админа, — и путь к ней попадает в реплику модели.
-    if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
-    else {
-      const fsKey = relayFsKey(relaySid);
-      if (fsKey) fd.append('fs_key', fsKey);
-    }
+    const FormData = require('form-data');
+    // Форма multipart — поток: на каждый повтор под шлагбаумом — новая.
+    const buildForm = () => {
+      const fd = new FormData();
+      fd.append('message', outboundPrompt);
+      if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
+      fd.append('sessionId', relaySid);
+      for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
+      if (opts.testMode === true) fd.append('testMode', 'true');
+      // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
+      // true (см. AgentReplyOpts); по умолчанию — нет.
+      //
+      // fs_key — не инструмент, а имя папки хода, и уходит всегда (спека
+      // 2026-11-02-pii-out-of-prompts-design.md, п. 3): без него релей называет
+      // папку по ключу сессии — у проверки версии ассистента это base64 с
+      // номером админа, — и путь к ней попадает в реплику модели.
+      if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
+      else {
+        const fsKey = relayFsKey(relaySid);
+        if (fsKey) fd.append('fs_key', fsKey);
+      }
+      return fd;
+    };
     const chunks: string[] = [];
     const usage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
@@ -3383,12 +3697,28 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const relayMark = this.beginRelayRun(relaySid);
     this.beginStream();
     try {
-    const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
-      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-      responseType: 'stream',
-      timeout: 300000,
-      maxRedirects: 0,
-    });
+    // Фоновый ход ждёт релей за шлагбаумом выката, как и ход человека, но без
+    // carry: его промпт человек не писал. Если человек написал, пока фоновый
+    // ход ждал, — уступаем, как при занятой сессии (routine-push отложит).
+    // Вызов под своим коротким таймаутом ждёт по своему расписанию
+    // (opts.relayDrainDelaysMs).
+    let resp: any;
+    try {
+      resp = await this.postRelayTurn(relaySid, relayMark, null, () => {
+        const fd = buildForm();
+        return axios.post(`${AGENT_URL}/chat`, fd, {
+          headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+          responseType: 'stream',
+          timeout: 300000,
+          maxRedirects: 0,
+        });
+      }, opts.relayDrainDelaysMs);
+    } catch (e) {
+      if (e instanceof RelayDrainingError && e.superseded) throw new RelaySessionBusyError(relaySid);
+      throw e;
+    }
+    // Разделитель после шага работы — как у веб-хода (block-separator.ts).
+    const joiner = new BlockJoiner(() => chunks.join(''));
     await new Promise<void>((resolve, reject) => {
       let buffer = '';
       resp.data.on('data', (chunk: Buffer) => {
@@ -3399,7 +3729,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
           if (!line.startsWith('data: ')) continue;
           try {
             const ev = JSON.parse(line.slice(6));
-            if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
+            if (ev.type === 'delta' || ev.type === 'text') chunks.push(joiner.text(ev.text));
+            else if (ev.type === 'tool') joiner.tool();
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
             else if (ev.type === 'done') {
               gotDone = true;
@@ -3542,12 +3873,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
    *
    * costUsd (total_cost_usd) при пришедшем usage в сумму не входит, только в
    * лог — почему, сказано внутри. `usd` — сколько долларов легло в основу списания.
+   *
+   * sessionCostAsSource=false убирает шаг 3 для costUsd: у оборванного хода
+   * (partial-billing.ts), упавшего на первом запросе, нет ни usage, ни
+   * стоимости хода, и сумма ушла бы по total_cost_usd — у возобновлённой
+   * сессии это стоимость ВСЕЙ сессии (14.10.2026 ход за $0.16 списан как
+   * $6.21). В расклад (note) costUsd идёт как есть.
    */
   private computeSdkCharge(
     usage: SdkUsageTotals | null,
     costUsd: number,
     text: string,
     turnCostUsd: number | null = null,
+    sessionCostAsSource = true,
   ): SdkCharge {
     const textLength = text.length;
     if (usage && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite5m || usage.cacheWrite1h)) {
@@ -3628,7 +3966,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         note: `usage не пришёл, считаю по стоимости хода=$${turnCostUsd.toFixed(4)}`,
       };
     }
-    if (costUsd > 0) {
+    if (sessionCostAsSource && costUsd > 0) {
       return {
         tokens: Math.ceil(costUsd * this.TOKENS_PER_USD),
         usd: costUsd,
@@ -3652,7 +3990,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       tokens: textLength * this.SDK_TEXT_MULTIPLIER,
       usd: 0,
       source: 'length',
-      note: 'ни usage, ни costUsd — откат на длину текста',
+      // costUsd > 0 сюда доходит только при sessionCostAsSource=false.
+      note: costUsd > 0
+        ? `ни usage, ни стоимости хода; сессия=$${costUsd.toFixed(4)} в счёт не идёт — откат на длину текста`
+        : 'ни usage, ни costUsd — откат на длину текста',
     };
   }
 
@@ -3686,8 +4027,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * 23% его баланса за одно сообщение) мы узнали только потому, что полезли
    * смотреть логи руками — сам по себе такой ход ничем себя не обозначает.
    *
-   * Смотрим на `charge.tokens`, а не на списанное: у оборванного хода списано 0,
-   * и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
+   * Смотрим на `charge.tokens`, а не на списанное: у сбоя, за который не
+   * списали (partial-billing.ts), списано 0, и дорогой сбой иначе прошёл бы
+   * молча — а он-то как раз и интересен.
    */
   private async alertExpensiveTurn(
     userId: string,
@@ -3752,14 +4094,86 @@ ${LanguageService.buildDirective(userLanguage)}`;
   }
 
   /**
+   * Решение о списании за ход кабинета (partial-billing.ts). Снаружи — только
+   * через turnChargeFor, вместе с суммой.
+   *
+   * text — весь текст хода, ушедший человеку. Служебный отказ CLI, долетевший
+   * им целиком (looksCliFailure), — не ответ модели: решение идёт как
+   * cli_fatal_text, которого нет в списке частичного списания, какую бы
+   * причину ни прислал релей.
+   */
+  private turnBilling(text: string, d: TurnDelivery): BillingDecision {
+    if (this.looksCliFailure(text)) return billingDecision({ ...d, failed: true, failReason: 'cli_fatal_text' });
+    return billingDecision(d);
+  }
+
+  /**
    * Стоимость хода с вложениями — тем же методом, что и обычный ход чата.
    *
    * Публичная обёртка нужна контроллеру: он показывает число пользователю в
    * событии `end` ДО того, как ход сохранён. Формула одна на оба пути — иначе
-   * повторяется история, из-за которой всё и затевалось.
+   * повторяется история, из-за которой всё и затевалось. С 17.11.2026 все
+   * пути зовут её через turnChargeFor — вместе с решением о списании.
    */
-  computeUploadCharge(usage: SdkUsageTotals | null, costUsd: number, text: string, turnCostUsd: number | null = null) {
-    return this.computeSdkCharge(usage, costUsd, text, turnCostUsd);
+  computeUploadCharge(
+    usage: SdkUsageTotals | null, costUsd: number, text: string, turnCostUsd: number | null = null,
+    sessionCostAsSource = true,
+  ) {
+    return this.computeSdkCharge(usage, costUsd, text, turnCostUsd, sessionCostAsSource);
+  }
+
+  /**
+   * Решение о списании и сумма за ход кабинета — одно правило на индикатор
+   * «N токенов» в `end` и на точку списания, у веб-хода (streamUniversalAgent:
+   * индикатор и persistResponse) и у хода с файлом (индикатор —
+   * ChatController.uploadAndChat, списание — persistUploadTurn). Разойдись они
+   * — человек увидел бы одно, а списалось бы другое.
+   *
+   * text — весь текст хода, ушедший человеку: по нему turnBilling узнаёт отказ
+   * CLI. chargeText — текст для запасного пути по длине у обычного хода (по
+   * умолчанию text): у веб-хода индикатор берёт сырой chunks.join(''), а
+   * persistResponse — очищенный fullText, давнее различие.
+   *
+   * modelText — текст МОДЕЛИ (delta/text/result), без служебных реплик релея и
+   * ссылок на файлы. «Пришедшее» и длина для запасного пути у оборванного хода
+   * — по тому, что человек мог прочесть:
+   * - без блоков product-action (модельные копии вычищаются из ответа) и
+   *   утёкшего синтаксиса инструментов; stripLeakedToolSyntax заодно обрезает
+   *   пробелы — релей шлёт и пустые text_delta («\n\n»), после них считает,
+   *   что текст пошёл, и при обрыве отдаёт transient_after_partial;
+   * - и только если в нём есть буква или цифра: одна разметка («**», «#»,
+   *   «---») — не ответ.
+   *
+   * У оборванного хода costUsd (total_cost_usd) — не источник суммы: у
+   * возобновлённой сессии это стоимость всей сессии (computeSdkCharge,
+   * sessionCostAsSource). В расклад и метаданные списания он идёт как есть.
+   *
+   * tokens — сколько списать и показать: 0, если ход не тарифицируется.
+   */
+  turnChargeFor(
+    turn: {
+      text: string;
+      chargeText?: string;
+      failed: boolean;
+      failReason: string;
+      modelText: string;
+      files: number;
+    },
+    usage: SdkUsageTotals | null,
+    costUsd: number,
+    turnCostUsd: number | null,
+  ): { billing: BillingDecision; charge: SdkCharge; tokens: number } {
+    const visible = this.stripLeakedToolSyntax(stripProductActionBlocks(turn.modelText));
+    const seen = /[\p{L}\p{N}]/u.test(visible) ? visible : '';
+    const billing = this.turnBilling(turn.text, {
+      failed: turn.failed, failReason: turn.failReason, modelChars: seen.length, files: turn.files,
+    });
+    // Через публичную обёртку, а не computeSdkCharge: её подменяет спек броска
+    // посреди finally контроллера (chat.upload-chat-files.spec.ts).
+    const charge = billing.partial
+      ? this.computeUploadCharge(usage, costUsd, seen, turnCostUsd, false)
+      : this.computeUploadCharge(usage, costUsd, turn.chargeText ?? turn.text, turnCostUsd);
+    return { billing, charge, tokens: billing.billable ? charge.tokens : 0 };
   }
 
   /**
@@ -3775,8 +4189,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * расхода и не заплатил ничего. Таких ходов с апреля накопилось 640.
    *
    * Стоимость считается заново из `usage`/`costUsd`, а не принимается готовой:
-   * метод должен уметь обнулить её сам (оборванный ход, отказ CLI), и решение
-   * об этом не может жить в контроллере.
+   * метод должен уметь обнулить её сам (сбой без ответа, отказ CLI). Решение и
+   * сумма — turnChargeFor, тот же вызов, по которому контроллер показал
+   * индикатор в `end`.
    */
   async persistUploadTurn(p: {
     userId: string;
@@ -3790,30 +4205,65 @@ ${LanguageService.buildDirective(userLanguage)}`;
     durationMs: number;
     turnFailed?: boolean;
     failReason?: string;
+    /**
+     * Текст МОДЕЛИ, ушедший человеку (delta/text/result), — без служебных
+     * реплик релея, ссылок на файлы и заглушек (partial-billing.ts). Решает,
+     * списывать ли оборванный ход, и идёт в запасной путь по длине. Не передан
+     * — оборванный ход без файлов не списывается, как до 17.11.2026.
+     */
+    modelText?: string;
+    /** Файлы хода, ушедшие человеку (outputFiles релея). */
+    files?: number;
+    /** Язык и сборка — для текста сбоя CLI на языке человека. */
+    userLanguage?: string;
+    storeBuild?: boolean;
+    /**
+     * Только строка человека: ход ждал релей за шлагбаумом выката, и его
+     * перебило новое сообщение — оно несёт текст этого хода к модели, а
+     * ответа у самого хода нет. Ни строки ассистента, ни списания.
+     */
+    userOnly?: boolean;
   }): Promise<number> {
+    if (p.userOnly) {
+      await this.saveUserMessageRow(p.userId, p.assistantId, p.userMsg);
+      return 0;
+    }
     let text = p.assistantMsg;
     let turnFailed = p.turnFailed === true;
     let failReason = p.failReason || '';
+    // Решение и сумма — те же, по которым контроллер показал индикатор в `end`
+    // (turnChargeFor, partial-billing.ts). Считаются по тексту ДО подмены
+    // отказа CLI заглушкой ниже: по этому тексту turnBilling отказ и узнаёт.
+    const { billing, charge, tokens: textCost } = this.turnChargeFor(
+      { text, failed: turnFailed, failReason, modelText: p.modelText ?? '', files: p.files ?? 0 },
+      p.usage, p.costUsd, p.turnCostUsd ?? null,
+    );
 
     // Защита в глубину, та же что в основном пути: служебный отказ CLI, долетевший
     // до нас целым ответом, пользователь не должен увидеть дословно и тем более
     // за него заплатить.
+    //
+    // cliRefusal — для метки журнала: отказ, узнанный по тексту, —
+    // cli_fatal_text, какую бы причину ни прислал релей (turnBilling решает так
+    // же). Как у веб-хода (persistResponse в streamUniversalAgent).
+    let cliRefusal = false;
     if (this.looksCliFailure(text)) {
       this.logger.error(`CLI-отказ долетел как ответ на загрузку (${p.userId}_${p.assistantId}): ${text.slice(0, 120)}`);
       turnFailed = true;
       failReason = failReason || 'cli_fatal_text';
-      text = '_Не получилось: временный сбой на стороне платформы. Токены за этот ход не списаны — попробуйте отправить сообщение ещё раз._';
+      cliRefusal = true;
+      text = chatFailureText('cliFatal', p.userLanguage, { storeBuild: p.storeBuild });
     }
 
-    const charge = this.computeSdkCharge(p.usage, p.costUsd, text, p.turnCostUsd ?? null);
-    // Ход без финального ответа пользователю не выставляется — решение владельца,
-    // то же самое, что в основном пути. Релей дописывает в такой ход строку
-    // «Токены за прерванный ход не списаны», и она должна оставаться правдой.
-    const textCost = turnFailed ? 0 : charge.tokens;
-    const logLine = turnFailed
-      ? `billing[upload:skipped:${failReason}]: ход без финального ответа — не тарифицирован, ` +
+    // Решение владельца 17.11.2026 — то же, что в основном пути: оборванный
+    // ход, после которого человек что-то получил, списывается по фактическому
+    // расходу (billing[upload:partial:…]); сбой без ответа не выставляется.
+    const logLine = !billing.billable
+      ? `billing[upload:skipped:${cliRefusal ? 'cli_fatal_text' : failReason}]: ход без финального ответа — не тарифицирован, ` +
         `иначе списали бы ${charge.tokens} (${charge.note})`
-      : `billing[upload:${charge.source}]: tokens=${textCost} ${charge.note}`;
+      : billing.partial
+        ? `billing[upload:partial:${billing.partial}:${charge.source}]: tokens=${textCost} ${charge.note}`
+        : `billing[upload:${charge.source}]: tokens=${textCost} ${charge.note}`;
     if (turnFailed || charge.source === 'length') this.logger.warn(logLine);
     else this.logger.log(logLine);
 
@@ -3822,7 +4272,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Лента одна и с «Чистым листом» (spec 2026-11-17-context-reset): ход с
     // файлом — всегда в `${userId}_${assistantId}`.
     await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost);
-    if (!turnFailed) {
+    // Оборванный ход с нулевым расходом (одни файлы, а в done ни usage, ни
+    // стоимости) строку не пишет: планировщик (TokenAccountingService) поднял
+    // бы 0 до минимума в 1 токен, а индикатор и история показали 0. Обычный
+    // ход — как раньше. То же условие — у веб-хода.
+    if (billing.billable && (textCost > 0 || !billing.partial)) {
       await this.addTokenTask(p.userId, 0, textCost, p.assistantId, {
         costUsd: Number(p.costUsd.toFixed(4)),
         turnCostUsd: typeof p.turnCostUsd === 'number' ? Number(p.turnCostUsd.toFixed(4)) : null,
@@ -3830,6 +4284,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         taken: charge.taken,
         durationMs: p.durationMs,
         replyChars: text.length,
+        ...(billing.partial ? { partial: billing.partial } : {}),
       });
       this.alertTurnCostFloor(p.userId, p.assistantId, charge, textCost);
       // Сторож роста стоимости — как в обычном ходе: только за записанным

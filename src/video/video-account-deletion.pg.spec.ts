@@ -4,12 +4,16 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { Pool } from 'pg';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
+import { DeletionCancelledError } from '../account-deletion/account-deletion.safe';
 import type { DeletionJobRow } from '../account-deletion/account-deletion.types';
 import { VideoService } from './video.service';
 import {
   discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
   VideoAccountDeletionAdapter,
 } from './video-account-deletion.adapter';
+import { canonicalChatUploadUrl, chatUploadIdFromUrl } from '../chat/chat-uploads/upload-image-source';
+import { ownBaseUrl } from '../common/net/own-media';
 
 /**
  * Task 12 против живого Postgres: discovery SQL (keyset по uuid + generation
@@ -212,6 +216,98 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
     expect(storageLog).toEqual([]);
   });
 
+  it('K4b: source_image_url на video-uploads/<другой>/ — чужой объект не удаляется, row удалена', async () => {
+    const neighbor = 'video-uploads/u-other/1700-face.jpg';
+    const jobId = await insertJob({
+      source_image_url: `https://minio.test/linkeon-smm-videos/${neighbor}`,
+    });
+    const storageLog: Array<{ bucket: string; key: string }> = [];
+    const svc = makeService(storageLog);
+
+    await svc.deleteVideoForDeletion(USER, jobId, DELETION_ID);
+
+    expect(storageLog.map((c) => c.key).sort()).toEqual([`videos/${jobId}.jpg`, `videos/${jobId}.mp4`]);
+    const rows = await pool.query('SELECT id FROM video_jobs WHERE id=$1', [jobId]);
+    expect(rows.rows).toHaveLength(0);
+  });
+
+  // Загрузка чата как портрет (main b100708d): в source_image_url задачи лежит
+  // <сайт>/webhook/chat-uploads/<uuid> — адрес загрузки, а не ключ бакета
+  // видео. Её объект стирает chat-upload.purge; video-job.purge не удаляет
+  // его, не считает пропуском и не ходит ни в чужой бакет, ни в сервис
+  // загрузок, ни в S3 мимо StorageService — при любом MINIO_PUBLIC_URL,
+  // включая голый домен сайта.
+  it.each([
+    ['<сайт>/smm-media', (site: string) => `${site}/smm-media`],
+    ['голый домен сайта', (site: string) => site],
+  ])('загрузка чата в source_image_url (MINIO_PUBLIC_URL = %s) — не цель purge видео', async (_label, minioBase) => {
+    const uploadId = '33333333-3333-4333-8333-333333333333';
+    const uploadUrl = canonicalChatUploadUrl(uploadId);
+    expect(uploadUrl).toBe(`${ownBaseUrl()}/webhook/chat-uploads/${uploadId}`);
+    // Фикстура — настоящий адрес загрузки, как его распознаёт видео-сервис.
+    expect(chatUploadIdFromUrl(uploadUrl)).toBe(uploadId);
+
+    const prevMinio = process.env.MINIO_PUBLIC_URL;
+    process.env.MINIO_PUBLIC_URL = minioBase(ownBaseUrl());
+    try {
+      const jobId = randomUUID();
+      await insertJob({
+        id: jobId,
+        thumbnail_url: `${process.env.MINIO_PUBLIC_URL}/linkeon-smm-videos/videos/${jobId}.jpg`,
+        source_image_url: uploadUrl,
+      });
+
+      const storageLog: Array<{ bucket: string; key: string }> = [];
+      const storageCalls: string[] = [];
+      const storage = new Proxy({}, {
+        get: (_t, prop) => (prop === 'then' ? undefined : (input: { bucket: string; key: string }) => {
+          storageCalls.push(String(prop));
+          if (prop !== 'deleteConfirmed') throw new Error(`storage.${String(prop)} не ожидался`);
+          storageLog.push(input);
+          return Promise.resolve('deleted' as const);
+        }),
+      });
+      const chatUploadsCalls: string[] = [];
+      const chatUploads = new Proxy({}, {
+        get: (_t, prop) => (prop === 'then' ? undefined : () => {
+          chatUploadsCalls.push(String(prop));
+          throw new Error(`chatUploads.${String(prop)} не ожидался`);
+        }),
+      });
+      const pgDuck = {
+        query: (sql: string, params?: any[]) => pool.query(sql, params),
+        getClient: () => pool.connect(),
+      };
+      const svc = new VideoService(
+        pgDuck as any,
+        { isConfigured: () => false } as any,
+        {} as any,
+        undefined,
+        storage as any,
+        chatUploads as any,
+      );
+      const s3Send = jest.spyOn((svc as any).s3, 'send').mockImplementation(async () => {
+        throw new Error('S3 мимо StorageService не ожидался');
+      });
+      const onSkipped = jest.fn();
+
+      await svc.deleteVideoForDeletion(USER, jobId, DELETION_ID, onSkipped);
+
+      expect(storageCalls.every((m) => m === 'deleteConfirmed')).toBe(true);
+      expect([...storageLog].sort((a, b) => a.key.localeCompare(b.key))).toEqual([
+        { bucket: 'linkeon-smm-videos', key: `videos/${jobId}.jpg` },
+        { bucket: 'linkeon-smm-videos', key: `videos/${jobId}.mp4` },
+      ]);
+      expect(onSkipped).not.toHaveBeenCalled();
+      expect(chatUploadsCalls).toEqual([]);
+      expect(s3Send).not.toHaveBeenCalled();
+      const rows = await pool.query('SELECT id FROM video_jobs WHERE id=$1', [jobId]);
+      expect(rows.rows).toHaveLength(0);
+    } finally {
+      process.env.MINIO_PUBLIC_URL = prevMinio;
+    }
+  });
+
   it('повторный вызов после purge — success (идемпотентность)', async () => {
     const jobId = await insertJob();
     const storageLog: Array<{ bucket: string; key: string }> = [];
@@ -248,5 +344,74 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
 
     const rows = await pool.query('SELECT id FROM video_jobs WHERE id=$1', [jobId]);
     expect(rows.rows).toHaveLength(0);
+  });
+
+  // K4 — личные загрузки video-uploads/<userId>/ без строки video_jobs.
+  function makeListingStorage(keys: string[], log: string[]) {
+    return {
+      listPage: jest.fn(async (input: { bucket: string; prefix: string }) => {
+        log.push(`list:${input.bucket}:${input.prefix}`);
+        return { keys: keys.filter((k) => k.startsWith(input.prefix)), truncated: false };
+      }),
+      deleteConfirmed: jest.fn(async (input: { bucket: string; key: string }) => {
+        log.push(`delete:${input.bucket}/${input.key}`);
+        return 'deleted' as const;
+      }),
+      delete: async () => undefined,
+      publicUrl: (bucket: string, key: string) => `https://minio.test/${bucket}/${key}`,
+    };
+  }
+
+  function makeUploadsService(storage: unknown) {
+    const pgDuck = {
+      query: (sql: string, params?: any[]) => pool.query(sql, params),
+      getClient: () => pool.connect(),
+    };
+    return new VideoService(
+      pgDuck as any,
+      { isConfigured: () => false } as any,
+      {} as any,
+      undefined,
+      storage as any,
+    );
+  }
+
+  it('K4 discovery: video-upload.purge на удалённое поколение без строк video_jobs; старое — пусто', async () => {
+    const current = await discoverVideoUploadsDeletion({
+      db: pool,
+      account: { userId: USER, deletionId: DELETION_ID, deletedAt: new Date() },
+      origin: 'explicit',
+    });
+    expect(current).toEqual({
+      jobs: [{ resourceType: 'video-upload.purge', resourceKey: 'video-uploads', phase: 'purge', payload: {} }],
+      skips: [],
+    });
+
+    const stale = await discoverVideoUploadsDeletion({
+      db: pool,
+      account: { userId: USER, deletionId: OLD_DELETION_ID, deletedAt: new Date() },
+      origin: 'explicit',
+    });
+    expect(stale).toEqual({ jobs: [], skips: [] });
+  });
+
+  it('K4 deleteVideoUploadsForDeletion: текущее поколение — обход своего префикса; старое — отмена без листинга', async () => {
+    const keys = [
+      `video-uploads/${USER}/1700-a.jpg`,
+      `video-uploads/${USER}-x/1700-n.jpg`,
+    ];
+    const log: string[] = [];
+    const storage = makeListingStorage(keys, log);
+    const svc = makeUploadsService(storage);
+
+    await expect(svc.deleteVideoUploadsForDeletion(USER, OLD_DELETION_ID))
+      .rejects.toBeInstanceOf(DeletionCancelledError);
+    expect(log).toEqual([]);
+
+    await svc.deleteVideoUploadsForDeletion(USER, DELETION_ID);
+    expect(log).toEqual([
+      `list:linkeon-smm-videos:video-uploads/${USER}/`,
+      `delete:linkeon-smm-videos/video-uploads/${USER}/1700-a.jpg`,
+    ]);
   });
 });
