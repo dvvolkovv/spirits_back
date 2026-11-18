@@ -15,6 +15,8 @@ import {
   deletionResourceHash,
   retryDelayMs,
   safeDeletionMessage,
+  accountDeletionWorkerFlagUnrecognized,
+  accountDeletionWorkerSkippedTickMessage,
   accountDeletionWorkerStateMessage,
   safeDeletionSkipMessage,
   safeDeletionTickMessage,
@@ -243,14 +245,27 @@ describe('account deletion safety', () => {
     },
   );
 
-  it.each([undefined, '', '   ', 'disabled', 'nope', '2', 'f', 'tru e'])(
-    'выключатель %j не распознан — значение по умолчанию (вкл)',
+  it.each([undefined, '', '   ', '\t\n'])(
+    'выключатель %j не задан или пуст — значение по умолчанию (вкл)',
     (value) => {
       expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: value }))
         .toBe(ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED);
       expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(true);
+      expect(accountDeletionWorkerFlagUnrecognized({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(false);
     },
   );
+
+  it.each(['disabled', 'nope', '2', 'f', 'tru e', 'fasle', 'выкл', ' Disabled '])(
+    'выключатель %j непустой и не распознан — выкл (ошибка в сторону «выкл»)',
+    (value) => {
+      expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(false);
+      expect(accountDeletionWorkerFlagUnrecognized({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(true);
+    },
+  );
+
+  it.each(['false', ' 0 ', 'true', 'YES'])('распознанное %j не помечается как нераспознанное', (value) => {
+    expect(accountDeletionWorkerFlagUnrecognized({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(false);
+  });
 
   it('хэширует MinIO locator с NUL-разделителем', () => {
     const bucket = 'account-assets';
@@ -1247,6 +1262,11 @@ describe('журнал воркера очистки — только числа
     [{ ACCOUNT_DELETION_WORKER_ENABLED: ' Off ' }, 'очистка удалённых аккаунтов: выключена (env=" Off ")'],
     [{ ACCOUNT_DELETION_WORKER_ENABLED: 'yes' }, 'очистка удалённых аккаунтов: включена (env="yes")'],
     [{ ACCOUNT_DELETION_WORKER_ENABLED: '' }, 'очистка удалённых аккаунтов: включена (env="")'],
+    [{ ACCOUNT_DELETION_WORKER_ENABLED: '   ' }, 'очистка удалённых аккаунтов: включена (env="   ")'],
+    [
+      { ACCOUNT_DELETION_WORKER_ENABLED: 'fasle' },
+      'очистка удалённых аккаунтов: выключена (env="fasle" не распознан — считается выключением; вкл: true/1/on/yes, выкл: false/0/off/no)',
+    ],
   ])('строка состояния %j', (env, expected) => {
     expect(accountDeletionWorkerStateMessage(env as NodeJS.ProcessEnv)).toBe(expected);
   });
@@ -1257,7 +1277,22 @@ describe('журнал воркера очистки — только числа
       DATABASE_URL: 'postgres://canary-secret@db/linkeon',
       JWT_SECRET: 'canary-jwt',
     });
-    expect(line).toBe(`очистка удалённых аккаунтов: включена (env="${'x'.repeat(32)}")`);
+    expect(line).toBe(
+      `очистка удалённых аккаунтов: выключена (env="${'x'.repeat(32)}" не распознан — считается выключением; вкл: true/1/on/yes, выкл: false/0/off/no)`,
+    );
+    expect(line).not.toContain('canary');
+  });
+
+  it('пропущенный тик из-за нераспознанного значения: значение обрезано, чужих переменных нет', () => {
+    expect(accountDeletionWorkerSkippedTickMessage({ ACCOUNT_DELETION_WORKER_ENABLED: 'fasle' })).toBe(
+      'очистка удалённых аккаунтов: тик пропущен (env="fasle" не распознан — считается выключением; вкл: true/1/on/yes, выкл: false/0/off/no)',
+    );
+    const line = accountDeletionWorkerSkippedTickMessage({
+      ACCOUNT_DELETION_WORKER_ENABLED: 'y'.repeat(100),
+      DATABASE_URL: 'postgres://canary-secret@db/linkeon',
+    });
+    expect(line).toContain(`env="${'y'.repeat(32)}"`);
+    expect(line).not.toContain('y'.repeat(33));
     expect(line).not.toContain('canary');
   });
 });

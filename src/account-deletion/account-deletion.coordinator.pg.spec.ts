@@ -42,8 +42,12 @@ describe('account deletion worker activation (owner gate D)', () => {
   it('при старте процесса пишет состояние выключателя и только его значение', () => {
     const saved = process.env;
     const lines: string[] = [];
+    const warnings: string[] = [];
     const spy = jest.spyOn(Logger.prototype, 'log').mockImplementation((message: any) => {
       lines.push(String(message));
+    });
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation((message: any) => {
+      warnings.push(String(message));
     });
     try {
       process.env = { ...saved, DATABASE_URL: 'postgres://canary-secret@db/linkeon' };
@@ -61,9 +65,18 @@ describe('account deletion worker activation (owner gate D)', () => {
         'очистка удалённых аккаунтов: включена (env=не задан)',
         'очистка удалённых аккаунтов: выключена (env=" Off ")',
       ]);
-      expect(lines.join('\n')).not.toContain('canary');
+      expect(warnings).toEqual([]);
+      // Нераспознанное непустое значение — выкл, и строка старта уходит в warn.
+      process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'fasle';
+      coordinator.onApplicationBootstrap();
+      expect(lines).toHaveLength(2);
+      expect(warnings).toEqual([
+        'очистка удалённых аккаунтов: выключена (env="fasle" не распознан — считается выключением; вкл: true/1/on/yes, выкл: false/0/off/no)',
+      ]);
+      expect([...lines, ...warnings].join('\n')).not.toContain('canary');
     } finally {
       spy.mockRestore();
+      warnSpy.mockRestore();
       process.env = saved;
     }
   });
@@ -324,6 +337,30 @@ describe('account deletion worker activation (owner gate D)', () => {
     expect(runAccount).not.toHaveBeenCalled();
     expect(executions).toEqual([]);
     expect(logLines.filter((line) => line.includes(TICK_LINE))).toEqual([]);
+    expect(logLines).toEqual([]);
+    query.mockRestore();
+    expect(await job(pending)).toMatchObject({ status: 'pending', attempts: 0 });
+  });
+
+  it('нераспознанное непустое env — тик пропущен без lock и SQL, одна warn-строка', async () => {
+    process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'fasle';
+    const current = account('u-unrecognized-flag');
+    await insertDeleted(current);
+    const pending = await insertJob(current, 'routine.stop', 'routine-1');
+    const { coordinator, pg, planner, executions } = compose({
+      'routine.stop': async () => undefined,
+    });
+    const query = jest.spyOn(pool, 'query');
+
+    await coordinator.tick({ retentionMs: 0 });
+
+    expect(pg.tryAdvisoryLock).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+    expect(planner.collect).not.toHaveBeenCalled();
+    expect(executions).toEqual([]);
+    expect(logLines).toEqual([
+      'очистка удалённых аккаунтов: тик пропущен (env="fasle" не распознан — считается выключением; вкл: true/1/on/yes, выкл: false/0/off/no)',
+    ]);
     query.mockRestore();
     expect(await job(pending)).toMatchObject({ status: 'pending', attempts: 0 });
   });
