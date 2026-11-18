@@ -8,6 +8,8 @@ import {
   ACCOUNT_DELETION_RETENTION_MS,
   DeletionTickTotals,
   accountDeletionWorkerEnabled,
+  accountDeletionWorkerFlagUnrecognized,
+  accountDeletionWorkerSkippedTickMessage,
   accountDeletionWorkerStateMessage,
   deletionErrorKind,
   safeDeletionMessage,
@@ -30,14 +32,24 @@ export class AccountDeletionCoordinator implements OnApplicationBootstrap {
     private readonly runner: AccountDeletionRunner,
   ) {}
 
-  /** Одна строка при старте процесса: включена ли очистка и значение env. */
+  /**
+   * Одна строка при старте процесса: включена ли очистка и значение env;
+   * нераспознанное значение (считается выключением) — в warn.
+   */
   onApplicationBootstrap(): void {
-    this.logger.log(accountDeletionWorkerStateMessage(process.env));
+    const message = accountDeletionWorkerStateMessage(process.env);
+    if (accountDeletionWorkerFlagUnrecognized(process.env)) this.logger.warn(message);
+    else this.logger.log(message);
   }
 
   @Cron('0 23 * * * *', { name: 'account-deletion-coordinator' })
   async tick(options: AccountDeletionTickOptions = {}): Promise<void> {
-    if (!accountDeletionWorkerEnabled(process.env)) return;
+    if (!accountDeletionWorkerEnabled(process.env)) {
+      if (accountDeletionWorkerFlagUnrecognized(process.env)) {
+        this.logger.warn(accountDeletionWorkerSkippedTickMessage(process.env));
+      }
+      return;
+    }
     const lock = await this.pg.tryAdvisoryLock(1947433922);
     if (!lock) return;
 

@@ -563,18 +563,34 @@ export function assertSafeSkip(skip: DeletionSkip): void {
 const WORKER_FLAG_OFF = new Set(['false', '0', 'off', 'no']);
 const WORKER_FLAG_ON = new Set(['true', '1', 'on', 'yes']);
 
+type WorkerFlagState = 'default' | 'on' | 'off' | 'unrecognized';
+
+function workerFlagState(env: NodeJS.ProcessEnv): WorkerFlagState {
+  const raw = env.ACCOUNT_DELETION_WORKER_ENABLED;
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (value === '') return 'default';
+  if (WORKER_FLAG_OFF.has(value)) return 'off';
+  if (WORKER_FLAG_ON.has(value)) return 'on';
+  return 'unrecognized';
+}
+
 /**
  * Аварийный выключатель часового тика (Gate D: по умолчанию включён).
  * Значение сравнивается после trim().toLowerCase(): false/0/off/no — выкл,
- * true/1/on/yes — вкл, прочее (в т. ч. пусто или нет переменной) —
- * ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED.
+ * true/1/on/yes — вкл; нет переменной, пусто или одни пробелы —
+ * ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED. Любое другое непустое значение
+ * (опечатка «fasle», «disabled», «выкл») — ВЫКЛ: аварийному выключателю
+ * безопаснее ошибиться в сторону «выкл»; координатор пишет об этом warn.
  */
 export function accountDeletionWorkerEnabled(env: NodeJS.ProcessEnv): boolean {
-  const raw = env.ACCOUNT_DELETION_WORKER_ENABLED;
-  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-  if (WORKER_FLAG_OFF.has(value)) return false;
-  if (WORKER_FLAG_ON.has(value)) return true;
-  return ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED;
+  const state = workerFlagState(env);
+  if (state === 'default') return ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED;
+  return state === 'on';
+}
+
+/** Непустое значение выключателя, не входящее ни в «вкл», ни в «выкл». */
+export function accountDeletionWorkerFlagUnrecognized(env: NodeJS.ProcessEnv): boolean {
+  return workerFlagState(env) === 'unrecognized';
 }
 
 /** Сводка одного тика координатора: только счётчики, без идентификаторов. */
@@ -612,17 +628,33 @@ export function safeDeletionTickMessage(totals: DeletionTickTotals & { durationM
     + ` stale=${safeCount(totals.stale)} ms=${ms}`;
 }
 
-/**
- * Строка журнала при старте процесса: состояние выключателя и значение ТОЛЬКО
- * ACCOUNT_DELETION_WORKER_ENABLED (обрезанное до 32 символов).
- */
-export function accountDeletionWorkerStateMessage(env: NodeJS.ProcessEnv): string {
+const WORKER_FLAG_UNRECOGNIZED_NOTE =
+  'не распознан — считается выключением; вкл: true/1/on/yes, выкл: false/0/off/no';
+
+function shownWorkerEnv(env: NodeJS.ProcessEnv): string {
   const raw = env.ACCOUNT_DELETION_WORKER_ENABLED;
-  const shown = typeof raw === 'string'
+  return typeof raw === 'string'
     ? JSON.stringify(raw.slice(0, WORKER_ENV_SHOWN_MAX))
     : 'не задан';
+}
+
+/**
+ * Строка журнала при старте процесса: состояние выключателя и значение ТОЛЬКО
+ * ACCOUNT_DELETION_WORKER_ENABLED (обрезанное до 32 символов). Для
+ * нераспознанного значения — пометка; координатор пишет её в warn.
+ */
+export function accountDeletionWorkerStateMessage(env: NodeJS.ProcessEnv): string {
   const state = accountDeletionWorkerEnabled(env) ? 'включена' : 'выключена';
-  return `${WORKER_LOG_PREFIX}: ${state} (env=${shown})`;
+  const note = accountDeletionWorkerFlagUnrecognized(env) ? ` ${WORKER_FLAG_UNRECOGNIZED_NOTE}` : '';
+  return `${WORKER_LOG_PREFIX}: ${state} (env=${shownWorkerEnv(env)}${note})`;
+}
+
+/**
+ * warn на каждом тике, пропущенном из-за нераспознанного значения: опечатка в
+ * .env не должна гасить очистку молча (явное false/0/off/no — молчит).
+ */
+export function accountDeletionWorkerSkippedTickMessage(env: NodeJS.ProcessEnv): string {
+  return `${WORKER_LOG_PREFIX}: тик пропущен (env=${shownWorkerEnv(env)} ${WORKER_FLAG_UNRECOGNIZED_NOTE})`;
 }
 
 interface SafeDeletionLogFields {
