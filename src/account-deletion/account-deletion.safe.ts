@@ -560,9 +560,20 @@ export function assertSafeSkip(skip: DeletionSkip): void {
   if (!DELETION_SKIP_REASONS.has(skip.reason)) throw new Error('unsafe_skip_reason');
 }
 
+const WORKER_FLAG_OFF = new Set(['false', '0', 'off', 'no']);
+const WORKER_FLAG_ON = new Set(['true', '1', 'on', 'yes']);
+
+/**
+ * Аварийный выключатель часового тика (Gate D: по умолчанию включён).
+ * Значение сравнивается после trim().toLowerCase(): false/0/off/no — выкл,
+ * true/1/on/yes — вкл, прочее (в т. ч. пусто или нет переменной) —
+ * ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED.
+ */
 export function accountDeletionWorkerEnabled(env: NodeJS.ProcessEnv): boolean {
-  if (env.ACCOUNT_DELETION_WORKER_ENABLED === 'false') return false;
-  if (env.ACCOUNT_DELETION_WORKER_ENABLED === 'true') return true;
+  const raw = env.ACCOUNT_DELETION_WORKER_ENABLED;
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (WORKER_FLAG_OFF.has(value)) return false;
+  if (WORKER_FLAG_ON.has(value)) return true;
   return ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED;
 }
 
