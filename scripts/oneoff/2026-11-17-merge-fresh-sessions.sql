@@ -17,15 +17,17 @@
 -- (а) После TEST-фазы deploy.sh — пробный прогон на test.linkeon.io: всё то
 --     же, но в конце ROLLBACK; ничего не меняет, печатает счётчики:
 --       sed 's/^COMMIT;$/ROLLBACK;/' scripts/oneoff/2026-11-17-merge-fresh-sessions.sql | psql "$U" -v ON_ERROR_STOP=1
+--     затем боевой перенос на test — командой из (в).
 -- (б) До deploy.sh — подсчёт листов людей на проде, только чтение (сессия
 --     read-only: запись база отвергнет); таблица точек ему не нужна. Список
 --     тестовых аккаунтов — копия того, что в скрипте ниже. Нет таблицы
 --     chat_uploads — убрать её звено из UNION.
 --       PGOPTIONS='-c default_transaction_read_only=on' psql "$U" -c "SELECT t AS таблица, count(*) AS строк, count(DISTINCT s) AS листов, count(DISTINCT s) FILTER (WHERE at >= now() - interval '24 hours') AS листов_за_сутки FROM (SELECT 'история' t, session_id s, created_at at FROM custom_chat_history UNION ALL SELECT 'загрузки', session_id, created_at FROM chat_uploads UNION ALL SELECT 'планы', session_id, updated_at FROM action_plans) x WHERE s ~ '^[^_]+_([0-9]{1,12}|custom:[0-9a-f-]{36})_fresh_[0-9]+$' AND split_part(s, '_', 1) NOT IN ('70000000000', '79030169187', '79169403771', '79656445804') AND NOT split_part(s, '_', 1) ~ '^790300[0-9]{5}$' GROUP BY 1 ORDER BY 1"
---     «листов_за_сутки» у истории — верхняя оценка числа точек. По (а) и (б) —
---     OK владельца.
--- (в) Сразу после прод-фазы deploy.sh — пробный прогон на проде (команда из
---     (а)); если цифры в пределах ожидаемого по (б) — перенос:
+--     «листов_за_сутки» у истории — верхняя оценка числа точек. По (б) — OK
+--     владельца одним пакетом (план, раздел «Выкат», шаг 0); (а) — уже в нём.
+-- (в) Как только прод-бэк перезапущен (по журналу deploy.sh, не дожидаясь
+--     прод-смоука) — пробный прогон на проде (команда из (а)); если цифры
+--     в пределах ожидаемого по (б) — перенос:
 --       psql "$U" -v ON_ERROR_STOP=1 -f scripts/oneoff/2026-11-17-merge-fresh-sessions.sql
 --
 -- Одна транзакция: упадёт любой шаг — не изменится ничего (и карты не будет).

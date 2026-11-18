@@ -9,6 +9,11 @@
  * перед ней ни одной «not delivered» для чата группы.
  *
  *   BASE_URL=https://my.linkeon.io TEST_PHONE=… DEBUG_SECRET=… node tests/problem-report.e2e.mjs
+ *
+ * С «Чистым листом» как точкой (spec 2026-11-17-context-reset) `fresh` + `freshTs`
+ * без `probe` ставит точку на аккаунте TEST_PHONE, и ход идёт в его основную
+ * ленту. Изоляция вопросов сохраняется (новая метка — новая точка, новый ключ
+ * релея), но бизнес-карточка и задачи аккаунта копятся между прогонами.
  */
 import debugSecret from './debug-secret.js';
 
