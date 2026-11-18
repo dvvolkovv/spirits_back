@@ -12,6 +12,19 @@ import type { DeletionJobRow } from './account-deletion.types';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 
+/** Исходы задач одного прогона runAccount (сводка тика, ревью Task 25 п.4). */
+export interface DeletionRunSummary {
+  done: number;
+  failed: number;
+  cancelled: number;
+  stale: number;
+}
+export type DeletionRunOutcome = keyof DeletionRunSummary;
+
+export function emptyDeletionRunSummary(): DeletionRunSummary {
+  return { done: 0, failed: 0, cancelled: 0, stale: 0 };
+}
+
 @Injectable()
 export class AccountDeletionRunner {
   private readonly logger = new Logger(AccountDeletionRunner.name);
@@ -22,11 +35,19 @@ export class AccountDeletionRunner {
     private readonly registry: AccountDeletionRegistry,
   ) {}
 
-  async runAccount(deletionId: string): Promise<void> {
+  /**
+   * Исполняет задачи поколения по очереди claimNext. Исходы копятся в
+   * summary (координатор передаёт свою сводку тика — счёт не теряется, даже
+   * если прогон оборвётся исключением) и возвращаются.
+   */
+  async runAccount(
+    deletionId: string,
+    summary: DeletionRunSummary = emptyDeletionRunSummary(),
+  ): Promise<DeletionRunSummary> {
     while (true) {
       const job = await this.jobs.claimNext(deletionId);
-      if (!job) return;
-      await this.runClaimed(job);
+      if (!job) return summary;
+      summary[await this.runClaimed(job)] += 1;
     }
   }
 
@@ -112,7 +133,7 @@ export class AccountDeletionRunner {
    * lease, актуальные attempts): heartbeat, адаптер, finish/fail. Вход —
    * только из runAccount/runImmediateStops и из нормализованного runJob.
    */
-  private async runClaimed(jobRow: DeletionJobRow): Promise<void> {
+  private async runClaimed(jobRow: DeletionJobRow): Promise<DeletionRunOutcome> {
     const job = jobRow;
 
     let heartbeatBusy = false;
@@ -155,7 +176,7 @@ export class AccountDeletionRunner {
     }
     if (adapterError) {
       const kind = deletionErrorKind(adapterError.value);
-      await this.jobs.fail(job, kind);
+      const recorded = await this.jobs.fail(job, kind);
       this.logger.warn(safeDeletionMessage({
         deletionId: job.deletionId,
         resourceType: job.resourceType,
@@ -164,7 +185,8 @@ export class AccountDeletionRunner {
         kind,
         userId: job.userId,
       }));
-      return;
+      if (!recorded) return 'stale';
+      return kind === 'cancelled' ? 'cancelled' : 'failed';
     }
 
     if (!await this.jobs.finish(job)) {
@@ -176,6 +198,8 @@ export class AccountDeletionRunner {
         kind: 'cancelled',
         userId: job.userId,
       }));
+      return 'stale';
     }
+    return 'done';
   }
 }

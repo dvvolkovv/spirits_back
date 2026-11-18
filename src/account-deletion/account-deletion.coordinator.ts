@@ -1,14 +1,17 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { AccountDeletionJobs } from './account-deletion.jobs';
 import { AccountDeletionPlanner } from './account-deletion.planner';
-import { AccountDeletionRunner } from './account-deletion.runner';
+import { AccountDeletionRunner, emptyDeletionRunSummary } from './account-deletion.runner';
 import {
   ACCOUNT_DELETION_RETENTION_MS,
+  DeletionTickTotals,
   accountDeletionWorkerEnabled,
+  accountDeletionWorkerStateMessage,
   deletionErrorKind,
   safeDeletionMessage,
+  safeDeletionTickMessage,
 } from './account-deletion.safe';
 
 export interface AccountDeletionTickOptions {
@@ -17,7 +20,7 @@ export interface AccountDeletionTickOptions {
 }
 
 @Injectable()
-export class AccountDeletionCoordinator {
+export class AccountDeletionCoordinator implements OnApplicationBootstrap {
   private readonly logger = new Logger(AccountDeletionCoordinator.name);
 
   constructor(
@@ -27,12 +30,19 @@ export class AccountDeletionCoordinator {
     private readonly runner: AccountDeletionRunner,
   ) {}
 
+  /** Одна строка при старте процесса: включена ли очистка и значение env. */
+  onApplicationBootstrap(): void {
+    this.logger.log(accountDeletionWorkerStateMessage(process.env));
+  }
+
   @Cron('0 23 * * * *', { name: 'account-deletion-coordinator' })
   async tick(options: AccountDeletionTickOptions = {}): Promise<void> {
     if (!accountDeletionWorkerEnabled(process.env)) return;
     const lock = await this.pg.tryAdvisoryLock(1947433922);
     if (!lock) return;
 
+    const startedAt = Date.now();
+    const totals: DeletionTickTotals = { accounts: 0, errors: 0, ...emptyDeletionRunSummary() };
     try {
       let after: [string, string] | null = null;
       do {
@@ -42,12 +52,14 @@ export class AccountDeletionCoordinator {
           options.retentionMs ?? ACCOUNT_DELETION_RETENTION_MS,
         );
         for (const account of accounts) {
+          totals.accounts += 1;
           try {
             const origin = await this.jobs.originOf(account);
             const plan = await this.planner.collect(this.pg, account, origin);
             await this.planner.persist(this.pg, account, plan);
-            await this.runner.runAccount(account.deletionId);
+            await this.runner.runAccount(account.deletionId, totals);
           } catch (error) {
+            totals.errors += 1;
             const kind = deletionErrorKind(error);
             this.logger.warn(safeDeletionMessage({
               deletionId: account.deletionId,
@@ -67,6 +79,7 @@ export class AccountDeletionCoordinator {
           : null;
       } while (after);
     } finally {
+      this.logger.log(safeDeletionTickMessage({ ...totals, durationMs: Date.now() - startedAt }));
       await lock.release();
     }
   }

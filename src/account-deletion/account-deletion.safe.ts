@@ -577,6 +577,54 @@ export function accountDeletionWorkerEnabled(env: NodeJS.ProcessEnv): boolean {
   return ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED;
 }
 
+/** Сводка одного тика координатора: только счётчики, без идентификаторов. */
+export interface DeletionTickTotals {
+  /** Аккаунтов, взятых тиком (dueAccounts). */
+  accounts: number;
+  /** Аккаунтов, обработка которых бросила (planner/persist/runner). */
+  errors: number;
+  /** Исходы задач раннера за тик. failed уйдёт на повтор по backoff. */
+  done: number;
+  failed: number;
+  cancelled: number;
+  /** Строка изменилась под раннером (lease/attempts/статус): исход не записан. */
+  stale: number;
+}
+
+const WORKER_LOG_PREFIX = 'очистка удалённых аккаунтов';
+const WORKER_ENV_SHOWN_MAX = 32;
+
+function safeCount(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * Строка журнала после тика, взявшего lock. Никогда не бросает (зовётся из
+ * finally рядом со снятием lock) и печатает только перечисленные счётчики:
+ * посторонние поля входа в строку не попадают.
+ */
+export function safeDeletionTickMessage(totals: DeletionTickTotals & { durationMs: number }): string {
+  const ms = typeof totals.durationMs === 'number' && Number.isFinite(totals.durationMs)
+    && totals.durationMs >= 0 ? Math.round(totals.durationMs) : 0;
+  return `${WORKER_LOG_PREFIX}: тик accounts=${safeCount(totals.accounts)}`
+    + ` errors=${safeCount(totals.errors)} done=${safeCount(totals.done)}`
+    + ` failed=${safeCount(totals.failed)} cancelled=${safeCount(totals.cancelled)}`
+    + ` stale=${safeCount(totals.stale)} ms=${ms}`;
+}
+
+/**
+ * Строка журнала при старте процесса: состояние выключателя и значение ТОЛЬКО
+ * ACCOUNT_DELETION_WORKER_ENABLED (обрезанное до 32 символов).
+ */
+export function accountDeletionWorkerStateMessage(env: NodeJS.ProcessEnv): string {
+  const raw = env.ACCOUNT_DELETION_WORKER_ENABLED;
+  const shown = typeof raw === 'string'
+    ? JSON.stringify(raw.slice(0, WORKER_ENV_SHOWN_MAX))
+    : 'не задан';
+  const state = accountDeletionWorkerEnabled(env) ? 'включена' : 'выключена';
+  return `${WORKER_LOG_PREFIX}: ${state} (env=${shown})`;
+}
+
 interface SafeDeletionLogFields {
   deletionId: string;
   resourceType: DeletionResourceType;
