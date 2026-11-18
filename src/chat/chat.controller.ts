@@ -103,8 +103,17 @@ export class ChatController {
    * `fresh` + `freshTs` старого клиента (вкладки до выката, Flutter, e2e):
    * точка на его метку. Сбой записи хода не роняет — ассистент ответит с
    * прежней памятью.
+   *
+   * Адрес ассистента — та же проверка, что у reset-context (RESET_ASSISTANT_RE):
+   * иначе assistantId из тела любой формы и длины ложился бы строкой в
+   * chat_context_resets. Не прошёл — точки нет, ход идёт как шёл, без журнала.
+   * Сюда же попадает запасной 'Роман' загрузки без assistantId: ключ сессии с
+   * ним допустим (resolveAgent ищет по имени), но под именем точку не ставит
+   * ни reset-context, ни фронт, и черту под ним не покажет ни один клиент —
+   * для него точка просто не ставится.
    */
   private async applyLegacyFresh(userId: string, assistantId: string, freshTs: unknown): Promise<void> {
+    if (!RESET_ASSISTANT_RE.test(assistantId)) return;
     const now = Date.now();
     const at = legacyFreshResetAt(freshTs, now);
     if (!at) {
@@ -369,8 +378,10 @@ export class ChatController {
     // Изолированной сессии у загрузок больше нет: пинги файлов не шлют. Точка —
     // до шлагбаума нуля, как в текстовом ходе (там шлагбаум внутри streamChat),
     // и до buildUploadHandoff: ключ релея, хвост и память загрузок читают её.
-    // Ключ ассистента — тот же assistantId (с запасным 'Роман'), что в
-    // `${userId}_${assistantId}` и у handoff, иначе точка легла бы мимо сессии.
+    // Ключ ассистента — тот же assistantId, что в `${userId}_${assistantId}` и
+    // у handoff, иначе точка легла бы мимо сессии. Запасной 'Роман' (нет
+    // assistantId) и любой адрес не в форме reset-context точку не получают —
+    // см. applyLegacyFresh.
     // Тело здесь multipart, поэтому флаг приезжает строкой, а не булевым.
     const freshFlag = body.fresh === true || body.fresh === 'true';
     if (freshFlag) await this.applyLegacyFresh(userId, String(assistantId), body.freshTs);
