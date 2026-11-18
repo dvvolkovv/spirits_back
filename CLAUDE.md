@@ -408,6 +408,12 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - `GET /webhook/user-profile?userId=` — профиль другого пользователя
 - `POST /webhook/set-email` — установка email
 
+### Удаление аккаунта: очистка (`src/account-deletion`)
+- С коммита `5b20c2cf` (Gate D) воркер очистки удалённых аккаунтов **включён по умолчанию**: cron `0 23 * * * *` — раз в час в HH:23, под advisory lock `1947433922` (lock занят — тик пропускается). Тик берёт аккаунты, удалённые ≥ 30 дней назад, доводит purge-задачи и повторяет упавшие задачи по backoff (до 6 ч).
+- Выключить: `ACCOUNT_DELETION_WORKER_ENABLED=false` в `.env` + рестарт процесса — только через `deploy.sh`, без ручного `pm2`. Значение без учёта регистра и пробелов: `false`/`0`/`off`/`no` — выкл, `true`/`1`/`on`/`yes` — вкл, прочее и пусто — по умолчанию (вкл).
+- Выключатель гасит только часовой тик (purge через 30 дней и повторы). Явный `DELETE /webhook/profile` (стопы и core) и `stopOnly` при слиянии аккаунтов работают всегда.
+- Журнал: при старте — `очистка удалённых аккаунтов: включена|выключена (env=…)`; после каждого тика с lock — `… тик accounts= errors= done= failed= cancelled= stale= ms=` (только числа; `failed` уйдёт на повтор).
+
 ### Avatar
 - `GET /webhook/avatar` — аватар пользователя (binary file)
 - `POST /webhook/avatar` — загрузка аватара
