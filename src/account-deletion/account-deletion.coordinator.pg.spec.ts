@@ -165,8 +165,11 @@ describe('account deletion worker activation (owner gate D)', () => {
       registry.register({ resourceTypes: [resourceType], execute });
     }
 
+    // Позднее связывание: pg.query зовёт pool.query в момент вызова, поэтому
+    // шпион на pool.query видит И SQL через pg, И SQL через jobs (те идут
+    // прямо в pool) — «ни одного SQL» в тестах ниже доказательно.
     const pg = {
-      query: pool.query.bind(pool),
+      query: (...args: unknown[]) => (pool.query as (...a: unknown[]) => unknown)(...args),
       tryAdvisoryLock: jest.fn(async () => lockResult),
     } as unknown as PgService;
     const planner = {
@@ -259,7 +262,7 @@ describe('account deletion worker activation (owner gate D)', () => {
     await insertDeleted(current);
     const { coordinator, pg, planner, runner } = compose({}, null);
     const runAccount = jest.spyOn(runner, 'runAccount');
-    const query = jest.spyOn(pg, 'query');
+    const query = jest.spyOn(pool, 'query');
 
     await coordinator.tick({ retentionMs: 0 });
 
@@ -279,7 +282,7 @@ describe('account deletion worker activation (owner gate D)', () => {
       'routine.stop': async () => undefined,
     });
     const runAccount = jest.spyOn(runner, 'runAccount');
-    const query = jest.spyOn(pg, 'query');
+    const query = jest.spyOn(pool, 'query');
 
     await coordinator.tick({ retentionMs: 0 });
 
@@ -289,6 +292,7 @@ describe('account deletion worker activation (owner gate D)', () => {
     expect(planner.persist).not.toHaveBeenCalled();
     expect(runAccount).not.toHaveBeenCalled();
     expect(executions).toEqual([]);
+    query.mockRestore();
     expect(await job(pending)).toMatchObject({ status: 'pending', attempts: 0 });
   });
 
@@ -299,10 +303,14 @@ describe('account deletion worker activation (owner gate D)', () => {
     const { coordinator, pg, planner, executions } = compose({
       'routine.stop': async () => undefined,
     });
+    const query = jest.spyOn(pool, 'query');
 
     expect(process.env.ACCOUNT_DELETION_WORKER_ENABLED).toBeUndefined();
     await coordinator.tick({ retentionMs: 0 });
 
+    // Контроль шпиона: тот же шпион, что в «ни одного SQL», видит SQL тика
+    // (dueAccounts через jobs и запросы раннера/адаптеров через pg).
+    expect(query.mock.calls.some(([sql]) => /FROM user_id/.test(String(sql)))).toBe(true);
     expect(pg.tryAdvisoryLock).toHaveBeenCalledWith(1947433922);
     expect(planner.collect).toHaveBeenCalledTimes(1);
     expect(planner.persist).toHaveBeenCalledTimes(1);
