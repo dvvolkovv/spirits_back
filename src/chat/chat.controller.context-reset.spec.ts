@@ -179,6 +179,42 @@ describe('ChatController: «Чистый лист» как точка', () => {
     expect(args[7]).toBe(false); // fresh
   });
 
+  // Адрес ассистента у старого клиента — та же проверка, что у reset-context:
+  // assistantId из тела любой формы и длины иначе лёг бы строкой в
+  // chat_context_resets (по строке на каждый мусорный id). Точка не ставится,
+  // ход идёт как шёл — в основную ленту.
+  it.each([
+    ['имя вместо id', 'Роман'],
+    ['пробел впереди', ' 10'],
+    ['длиннее 12 цифр', '1'.repeat(13)],
+    ['длинная строка', 'x'.repeat(101)],
+    ['custom: без uuid', 'custom:abc'],
+    ['CUSTOM: заглавными', 'CUSTOM:3f2b8c1e-9d4a-4e6b-8a7c-1b2d3e4f5a6b'],
+    ['дробное число', 1.5],
+  ])('fresh старого клиента с кривым ассистентом (%s) — точку не ставит, ход идёт', async (_label, assistantId) => {
+    const ts = String(Date.now() - 60_000);
+    const { ctrl, chatService, resets } = makeCtrl();
+    const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
+    await ctrl.chat(chatReq({ message: 'q', assistantId, fresh: true, freshTs: ts }), res());
+    expect(resets.reset).not.toHaveBeenCalled();
+    expect(chatService.streamChat).toHaveBeenCalledTimes(1);
+    const args = chatService.streamChat.mock.calls[0] as any[];
+    expect(args[3]).toBe(`u1_${assistantId}`);
+    expect(args[7]).toBe(false);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['число строкой', '10', '10'],
+    ['число', 10, '10'],
+    ['пользовательский ассистент', 'custom:3f2b8c1e-9d4a-4e6b-8a7c-1b2d3e4f5a6b', 'custom:3f2b8c1e-9d4a-4e6b-8a7c-1b2d3e4f5a6b'],
+  ])('fresh старого клиента с нормальным ассистентом (%s) — точка на ту же пару', async (_label, assistantId, expected) => {
+    const ts = String(Date.now() - 60_000);
+    const { ctrl, resets } = makeCtrl();
+    await ctrl.chat(chatReq({ message: 'q', assistantId, fresh: true, freshTs: ts }), res());
+    expect(resets.reset).toHaveBeenCalledWith('u1', expected, new Date(Number(ts)));
+  });
+
   it('пинг мониторинга (probe у тестового аккаунта) — прежний изолированный путь, точка не трогается', async () => {
     const ts = String(Date.now());
     const { ctrl, chatService, resets } = makeCtrl({ userId: '70000000000' });

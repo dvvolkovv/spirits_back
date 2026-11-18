@@ -249,14 +249,25 @@ describe('uploadAndChat: файл уходит в сессию разговор�
     expect(fields.sessionId).toBe(relaySessionKey('u1', '12', 'ru', undefined, new Date(ts)));
   });
 
-  it('без assistantId (запасной «Роман») точка — под тем же ключом ассистента, что и сессия', async () => {
-    // Сессия загрузки ключуется `${userId}_${assistantId}` с запасным 'Роман';
-    // точка обязана лечь на ту же пару, иначе ChatService её не увидит.
+  it('без assistantId (запасной «Роман») загрузка идёт, но точку не ставит', async () => {
+    // Сессия загрузки ключуется `${userId}_${assistantId}` с запасным 'Роман' —
+    // ключ допустим (resolveAgent находит ассистента по имени). Но точка — по
+    // адресу в той форме, что у reset-context (число или custom:<uuid>): точку
+    // под именем не поставит и не сотрёт ни одна другая ручка, и строки с
+    // произвольным id не копятся в chat_context_resets. Ход — без точки.
     const ts = Date.now() - 1000;
     const { resets, fields } = await uploadWithResets({ fresh: 'true', freshTs: String(ts) }, true);
 
-    expect(resets.reset).toHaveBeenCalledWith('u1', 'Роман', new Date(ts));
-    expect(fields.sessionId).toBe(relaySessionKey('u1', 'Роман', 'ru', undefined, new Date(ts)));
+    expect(resets.reset).not.toHaveBeenCalled();
+    expect(fields.sessionId).toBe(relaySessionKey('u1', 'Роман', 'ru'));
+  });
+
+  it('кривой assistantId у загрузки — точку не ставит, файл уходит как обычно', async () => {
+    const ts = Date.now() - 1000;
+    const { resets, post } = await uploadWithResets({ fresh: 'true', freshTs: String(ts), assistantId: 'x'.repeat(101) });
+
+    expect(resets.reset).not.toHaveBeenCalled();
+    expect(post).toHaveBeenCalledTimes(1);
   });
 
   it('чистый лист старого клиента при нулевом балансе: точка ставится и до шлагбаума — как в текстовом ходе', async () => {
