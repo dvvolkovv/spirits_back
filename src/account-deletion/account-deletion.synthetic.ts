@@ -1371,6 +1371,30 @@ export async function deleteExplicitWithHost(
 }
 
 /**
+ * Возвращает ACCOUNT_DELETION_WORKER_ENABLED к прежнему значению: не было —
+ * удалить, было — присвоить. С Gate D «удалить» значит «включён по
+ * умолчанию», поэтому просто delete терял бы снятый выключатель (=false).
+ */
+export function restoreAccountDeletionWorkerEnv(previous: string | undefined): void {
+  if (previous === undefined) delete process.env.ACCOUNT_DELETION_WORKER_ENABLED;
+  else process.env.ACCOUNT_DELETION_WORKER_ENABLED = previous;
+}
+
+/**
+ * Включает воркер на время fn (синтетический tick) и восстанавливает прежнее
+ * значение env — в том числе когда fn бросает.
+ */
+export async function withAccountDeletionWorkerEnabled<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.ACCOUNT_DELETION_WORKER_ENABLED;
+  process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
+  try {
+    return await fn();
+  } finally {
+    restoreAccountDeletionWorkerEnv(previous);
+  }
+}
+
+/**
  * tick с env-гейтом воркера и перемоткой next_attempt_at (purge-задачи
  * планируются на deletedAt+30д; rewind — тестовая фикстура). retentionMs
  * передаётся ТОЛЬКО сюда аргументом.
@@ -1399,15 +1423,10 @@ export async function tickSynthetic(
                          WHERE deletion_id = $1)`,
     [deletionId],
   );
-  process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
-  try {
-    await coordinator.tick({
-      retentionMs: options.retentionMs,
-      batchSize: options.batchSize ?? 2,
-    });
-  } finally {
-    delete process.env.ACCOUNT_DELETION_WORKER_ENABLED;
-  }
+  await withAccountDeletionWorkerEnabled(() => coordinator.tick({
+    retentionMs: options.retentionMs,
+    batchSize: options.batchSize ?? 2,
+  }));
 }
 
 /**

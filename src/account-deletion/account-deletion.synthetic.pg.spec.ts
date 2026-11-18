@@ -12,6 +12,7 @@ import {
   cleanupSyntheticFixture,
   createSyntheticStack,
   reseedConsumedResources,
+  restoreAccountDeletionWorkerEnv,
   seedSyntheticFixture,
   seedSyntheticHost,
   SYNTHETIC_DELETION_PREFIX,
@@ -22,6 +23,7 @@ import {
   SYNTHETIC_RESTART_PHONE,
   type SyntheticFixture,
   type SyntheticStack,
+  withAccountDeletionWorkerEnabled,
 } from './account-deletion.synthetic';
 
 /**
@@ -45,8 +47,9 @@ import {
  *  - retentionMs передаётся ТОЛЬКО аргументом tick() (ловушка 9);
  *  - purge-задачи планируются на deletedAt+30д, поэтому tick-обёртка
  *    перематывает next_attempt_at (фикстура, прецедент — coordinator pg spec);
- *  - ACCOUNT_DELETION_WORKER_ENABLED выставляется вокруг tick и снимается
- *    в afterEach (ловушка 1);
+ *  - ACCOUNT_DELETION_WORKER_ENABLED выставляется вокруг tick и ВОССТАНАВЛИВАЕТСЯ
+ *    к прежнему значению — и после tick, и в afterEach (ловушка 1; с Gate D
+ *    «удалить переменную» = «включён», а не «выключен»);
  *  - coordinator restart моделируется НОВЫМ instance + UPDATE lease_until
  *    в прошлое (ловушка 11);
  *  - reactivate — прод-путь IdentityService.resolveOrCreate (ловушка 5);
@@ -340,15 +343,10 @@ maybe('synthetic deletion lifecycle — полная цепочка против
                            WHERE deletion_id = $1)`,
       [deletionId],
     );
-    process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
-    try {
-      await stack.coordinator.tick({
-        retentionMs: options.retentionMs,
-        batchSize: options.batchSize ?? 2,
-      });
-    } finally {
-      delete process.env.ACCOUNT_DELETION_WORKER_ENABLED;
-    }
+    await withAccountDeletionWorkerEnabled(() => stack.coordinator.tick({
+      retentionMs: options.retentionMs,
+      batchSize: options.batchSize ?? 2,
+    }));
   }
 
   /** Retry-фаза: отказы сняты; цикл rewind → tick → host-агент до done. */
@@ -822,8 +820,9 @@ maybe('synthetic deletion lifecycle — полная цепочка против
   });
 
   afterEach(() => {
-    // Ловушка 1: env-гейт воркера не должен переживать тест.
-    delete process.env.ACCOUNT_DELETION_WORKER_ENABLED;
+    // Ловушка 1: env-гейт воркера не должен переживать тест — возвращаем
+    // значение, бывшее до suite (не было — удаляем).
+    restoreAccountDeletionWorkerEnv(savedEnv.ACCOUNT_DELETION_WORKER_ENABLED);
   });
 
   // ------------------------------------------------------------------ tests
@@ -981,13 +980,10 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     );
 
     const restarted = stack.makeCoordinator();
-    process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
-    try {
+    await withAccountDeletionWorkerEnabled(async () => {
       await sleep(5);
       await restarted.tick({ retentionMs: 0, batchSize: 2 });
-    } finally {
-      delete process.env.ACCOUNT_DELETION_WORKER_ENABLED;
-    }
+    });
     expect(await jobStatus(victim.id)).toBe('done');
 
     // Остальные purge-задачи доделывает обычный tick.
