@@ -24,6 +24,7 @@ import type {
 
 const PG = process.env.PROVISIONING_PG_URL;
 const PROVIDER_RAW = 'PROVIDER_RAW_SECRET';
+const TICK_LINE = 'очистка удалённых аккаунтов: тик';
 
 type AdapterImplementation = (
   job: DeletionJobRow,
@@ -36,6 +37,35 @@ describe('account deletion worker activation (owner gate D)', () => {
   it('после owner-approved activation worker по умолчанию включён, env=false остаётся аварийным выключателем', () => {
     expect(accountDeletionWorkerEnabled({})).toBe(true);
     expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: 'false' })).toBe(false);
+  });
+
+  it('при старте процесса пишет состояние выключателя и только его значение', () => {
+    const saved = process.env;
+    const lines: string[] = [];
+    const spy = jest.spyOn(Logger.prototype, 'log').mockImplementation((message: any) => {
+      lines.push(String(message));
+    });
+    try {
+      process.env = { ...saved, DATABASE_URL: 'postgres://canary-secret@db/linkeon' };
+      delete process.env.ACCOUNT_DELETION_WORKER_ENABLED;
+      const coordinator = new AccountDeletionCoordinator(
+        {} as PgService,
+        {} as AccountDeletionPlanner,
+        {} as AccountDeletionJobs,
+        {} as AccountDeletionRunner,
+      );
+      coordinator.onApplicationBootstrap();
+      process.env.ACCOUNT_DELETION_WORKER_ENABLED = ' Off ';
+      coordinator.onApplicationBootstrap();
+      expect(lines).toEqual([
+        'очистка удалённых аккаунтов: включена (env=не задан)',
+        'очистка удалённых аккаунтов: выключена (env=" Off ")',
+      ]);
+      expect(lines.join('\n')).not.toContain('canary');
+    } finally {
+      spy.mockRestore();
+      process.env = saved;
+    }
   });
 });
 
@@ -271,6 +301,7 @@ describe('account deletion worker activation (owner gate D)', () => {
     expect(planner.collect).not.toHaveBeenCalled();
     expect(planner.persist).not.toHaveBeenCalled();
     expect(runAccount).not.toHaveBeenCalled();
+    expect(logLines.filter((line) => line.includes(TICK_LINE))).toEqual([]);
   });
 
   it('env=false — аварийный выключатель: ни advisory lock, ни SQL, ни planner/adapters', async () => {
@@ -292,6 +323,7 @@ describe('account deletion worker activation (owner gate D)', () => {
     expect(planner.persist).not.toHaveBeenCalled();
     expect(runAccount).not.toHaveBeenCalled();
     expect(executions).toEqual([]);
+    expect(logLines.filter((line) => line.includes(TICK_LINE))).toEqual([]);
     query.mockRestore();
     expect(await job(pending)).toMatchObject({ status: 'pending', attempts: 0 });
   });
@@ -344,6 +376,47 @@ describe('account deletion worker activation (owner gate D)', () => {
       [fresh.deletionId],
     );
     expect(freshJobs.rows[0].n).toBe(1);
+  });
+
+  it('после тика с lock — одна строка сводки: числа исходов, без userId/deletionId/ключей', async () => {
+    const withJobs = account('u-tick-summary', new Date(Date.now() - 120_000));
+    const broken = account('u-tick-planner-error', new Date(Date.now() - 60_000));
+    await insertDeleted(withJobs);
+    await insertDeleted(broken);
+    await insertJob(withJobs, 'routine.stop', 'routine-ok');
+    await insertJob(withJobs, 'calendar.stop', 'cal-503');
+    await insertJob(withJobs, 'product.stop', 'product-cancelled');
+    const lock = { release: jest.fn(async () => undefined) };
+    const { coordinator, planner } = compose({
+      'routine.stop': async () => undefined,
+      'calendar.stop': async () => {
+        const error: any = new Error(PROVIDER_RAW);
+        error.response = { status: 503 };
+        throw error;
+      },
+      'product.stop': async () => {
+        throw new DeletionCancelledError();
+      },
+    }, lock);
+    (planner.collect as unknown as jest.Mock).mockImplementation(async (_db, value) => {
+      if (value.userId === broken.userId) throw new Error(`${PROVIDER_RAW} ${broken.userId}`);
+      return { jobs: [], skips: [] };
+    });
+
+    await coordinator.tick({ retentionMs: 0 });
+
+    const tickLines = logLines.filter((line) => line.includes(TICK_LINE));
+    expect(tickLines).toHaveLength(1);
+    expect(tickLines[0]).toMatch(
+      /^очистка удалённых аккаунтов: тик accounts=2 errors=1 done=1 failed=1 cancelled=1 stale=0 ms=\d+$/,
+    );
+    for (const secret of [
+      withJobs.userId, broken.userId, withJobs.deletionId, broken.deletionId,
+      'routine-ok', 'cal-503', 'product-cancelled', PROVIDER_RAW,
+    ]) {
+      expect(tickLines[0]).not.toContain(secret);
+    }
+    expect(lock.release).toHaveBeenCalledTimes(1);
   });
 
   it('core ждёт stop даже при более раннем next_attempt_at; нулевое число stop не блокирует', async () => {

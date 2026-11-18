@@ -15,7 +15,9 @@ import {
   deletionResourceHash,
   retryDelayMs,
   safeDeletionMessage,
+  accountDeletionWorkerStateMessage,
   safeDeletionSkipMessage,
+  safeDeletionTickMessage,
   withDeletionTimeout,
 } from './account-deletion.safe';
 import type {
@@ -1208,5 +1210,54 @@ describe('safeDeletionSkipMessage — пропуск отличим от сбо�
     ['строка', { not_owned: '1' }],
   ])('счётчики: %s — unsafe_count', (_label, counts) => {
     expect(() => safeDeletionSkipMessage(skipWith({ counts }))).toThrow(/^unsafe_count$/);
+  });
+});
+
+describe('журнал воркера очистки — только числа и состояние (ревью Task 25, п.4)', () => {
+  const TOTALS = { accounts: 2, errors: 1, done: 5, failed: 1, cancelled: 0, stale: 0 };
+
+  it('строка тика: фиксированный порядок полей, длительность округлена', () => {
+    expect(safeDeletionTickMessage({ ...TOTALS, durationMs: 1234.6 })).toBe(
+      'очистка удалённых аккаунтов: тик accounts=2 errors=1 done=5 failed=1 cancelled=0 stale=0 ms=1235',
+    );
+  });
+
+  it('строка тика не печатает посторонние поля и не бросает на мусорных числах', () => {
+    const line = safeDeletionTickMessage({
+      ...TOTALS,
+      accounts: Number.NaN,
+      errors: -3,
+      done: 1.5,
+      durationMs: Number.POSITIVE_INFINITY,
+      userId: USER_ID,
+      deletionId: DELETION_ID,
+      resourceKey: 'routine-secret-key',
+    } as any);
+    expect(line).toBe(
+      'очистка удалённых аккаунтов: тик accounts=0 errors=0 done=0 failed=1 cancelled=0 stale=0 ms=0',
+    );
+    expect(line).not.toContain(USER_ID);
+    expect(line).not.toContain(DELETION_ID);
+    expect(line).not.toContain('routine-secret-key');
+  });
+
+  it.each([
+    [{}, 'очистка удалённых аккаунтов: включена (env=не задан)'],
+    [{ ACCOUNT_DELETION_WORKER_ENABLED: 'false' }, 'очистка удалённых аккаунтов: выключена (env="false")'],
+    [{ ACCOUNT_DELETION_WORKER_ENABLED: ' Off ' }, 'очистка удалённых аккаунтов: выключена (env=" Off ")'],
+    [{ ACCOUNT_DELETION_WORKER_ENABLED: 'yes' }, 'очистка удалённых аккаунтов: включена (env="yes")'],
+    [{ ACCOUNT_DELETION_WORKER_ENABLED: '' }, 'очистка удалённых аккаунтов: включена (env="")'],
+  ])('строка состояния %j', (env, expected) => {
+    expect(accountDeletionWorkerStateMessage(env as NodeJS.ProcessEnv)).toBe(expected);
+  });
+
+  it('строка состояния — только своя переменная, длинное значение обрезано', () => {
+    const line = accountDeletionWorkerStateMessage({
+      ACCOUNT_DELETION_WORKER_ENABLED: 'x'.repeat(100),
+      DATABASE_URL: 'postgres://canary-secret@db/linkeon',
+      JWT_SECRET: 'canary-jwt',
+    });
+    expect(line).toBe(`очистка удалённых аккаунтов: включена (env="${'x'.repeat(32)}")`);
+    expect(line).not.toContain('canary');
   });
 });
