@@ -227,6 +227,29 @@ describe('account deletion safety', () => {
     expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: 'false' })).toBe(false);
   });
 
+  it.each(['false', '0', 'off', 'no', 'FALSE', 'False', ' False ', '\tno\n', 'OFF', ' 0 '])(
+    'выключатель %j — выкл (trim + регистр не важен)',
+    (value) => {
+      expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(false);
+    },
+  );
+
+  it.each(['true', '1', 'on', 'yes', 'TRUE', 'True', ' Yes ', 'On', ' 1 '])(
+    'выключатель %j — вкл (trim + регистр не важен)',
+    (value) => {
+      expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(true);
+    },
+  );
+
+  it.each([undefined, '', '   ', 'disabled', 'nope', '2', 'f', 'tru e'])(
+    'выключатель %j не распознан — значение по умолчанию (вкл)',
+    (value) => {
+      expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: value }))
+        .toBe(ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED);
+      expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: value })).toBe(true);
+    },
+  );
+
   it('хэширует MinIO locator с NUL-разделителем', () => {
     const bucket = 'account-assets';
     const key = 'chat/file-1.mp4';
