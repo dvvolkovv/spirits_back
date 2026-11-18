@@ -11,6 +11,7 @@ import {
   DELETION_RESOURCE_TYPES,
   DeletionCancelledError,
   DeletionRetryError,
+  accountDeletionWorkerEnabled,
 } from './account-deletion.safe';
 import type { PgService } from '../common/services/pg.service';
 import type {
@@ -28,6 +29,15 @@ type AdapterImplementation = (
   job: DeletionJobRow,
   ctx: DeletionExecution,
 ) => Promise<void>;
+
+// Gate D (Task 25): контракт флага чистый, без БД — поэтому вне PG-describe,
+// чтобы не пропускаться в unit-прогоне без PROVISIONING_PG_URL.
+describe('account deletion worker activation (owner gate D)', () => {
+  it('после owner-approved activation worker по умолчанию включён, env=false остаётся аварийным выключателем', () => {
+    expect(accountDeletionWorkerEnabled({})).toBe(true);
+    expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: 'false' })).toBe(false);
+  });
+});
 
 (PG ? describe : describe.skip)('account deletion coordinator', () => {
   let pool: Pool;
@@ -260,8 +270,15 @@ type AdapterImplementation = (
     expect(runAccount).not.toHaveBeenCalled();
   });
 
-  it('при отсутствующем env по умолчанию выключен и не выполняет ни одного SQL', async () => {
-    const { coordinator, pg, planner } = compose();
+  it('env=false — аварийный выключатель: ни advisory lock, ни SQL, ни planner/adapters', async () => {
+    process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'false';
+    const current = account('u-kill-switch');
+    await insertDeleted(current);
+    const pending = await insertJob(current, 'routine.stop', 'routine-1');
+    const { coordinator, pg, planner, runner, executions } = compose({
+      'routine.stop': async () => undefined,
+    });
+    const runAccount = jest.spyOn(runner, 'runAccount');
     const query = jest.spyOn(pg, 'query');
 
     await coordinator.tick({ retentionMs: 0 });
@@ -269,6 +286,28 @@ type AdapterImplementation = (
     expect(pg.tryAdvisoryLock).not.toHaveBeenCalled();
     expect(query).not.toHaveBeenCalled();
     expect(planner.collect).not.toHaveBeenCalled();
+    expect(planner.persist).not.toHaveBeenCalled();
+    expect(runAccount).not.toHaveBeenCalled();
+    expect(executions).toEqual([]);
+    expect(await job(pending)).toMatchObject({ status: 'pending', attempts: 0 });
+  });
+
+  it('при отсутствующем env после owner-approved activation включён: lock и due account исполняется', async () => {
+    const current = account('u-default-on');
+    await insertDeleted(current);
+    const pending = await insertJob(current, 'routine.stop', 'routine-1');
+    const { coordinator, pg, planner, executions } = compose({
+      'routine.stop': async () => undefined,
+    });
+
+    expect(process.env.ACCOUNT_DELETION_WORKER_ENABLED).toBeUndefined();
+    await coordinator.tick({ retentionMs: 0 });
+
+    expect(pg.tryAdvisoryLock).toHaveBeenCalledWith(1947433922);
+    expect(planner.collect).toHaveBeenCalledTimes(1);
+    expect(planner.persist).toHaveBeenCalledTimes(1);
+    expect(executions).toEqual(['routine.stop:routine-1']);
+    expect(await job(pending)).toMatchObject({ status: 'done', attempts: 1, leaseUntil: null });
   });
 
   it('core ждёт stop даже при более раннем next_attempt_at; нулевое число stop не блокирует', async () => {

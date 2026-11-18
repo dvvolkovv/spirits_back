@@ -220,9 +220,9 @@ describe('account deletion safety', () => {
     expect([1, 2, 3, 20].map(retryDelayMs)).toEqual([60_000, 120_000, 240_000, 21_600_000]);
   });
 
-  it('держит worker выключенным по умолчанию и признаёт явный флаг', () => {
-    expect(ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED).toBe(false);
-    expect(accountDeletionWorkerEnabled({})).toBe(false);
+  it('после owner-approved activation держит worker включённым по умолчанию и признаёт явный флаг', () => {
+    expect(ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED).toBe(true);
+    expect(accountDeletionWorkerEnabled({})).toBe(true);
     expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: 'true' })).toBe(true);
     expect(accountDeletionWorkerEnabled({ ACCOUNT_DELETION_WORKER_ENABLED: 'false' })).toBe(false);
   });
