@@ -184,9 +184,26 @@ export class ChatUploadsService {
       exhausted: false,
     };
 
+    // Владелец не активен (INSERT под гейтом не вставил строку): остальные
+    // файлы вызова в хранилище уже не пишутся — их строки гейт тоже не
+    // пропустит, а каждый лишний объект без строки рискует остаться в MinIO,
+    // если уборка не удастся.
+    let ownerInactive = false;
+
     for (const file of input.files) {
+      if (ownerInactive) {
+        result.failed.push(file.originalname);
+        continue;
+      }
       const storageKey = `${randomUUID()}/${safeFileName(file.originalname)}`;
       const mime = file.mimetype || 'application/octet-stream';
+      // Только вид ошибки (errKind) и обезличенный id объекта: имя файла —
+      // пользовательские данные, а сообщения pg/S3 повторяют его и ключ
+      // объекта. id загрузки здесь ещё нет (строка не записана), ключ сессии
+      // и userId содержат номер телефона; uuid-префикс storage_key
+      // (storageKeyLogId) находит в MinIO объект, если уборка не удалась.
+      // Префиксы строк стабильны — по ним грепают журнал.
+      const keyId = this.storageKeyLogId(storageKey);
       let thumbKey: string | null = null;
       try {
         const sha256 = createHash('sha256').update(file.buffer).digest('hex');
@@ -198,10 +215,17 @@ export class ChatUploadsService {
           cacheControl: 'private, no-store',
         });
         thumbKey = await this.saveThumb(file, mime, storageKey, thumbBudget);
+        // Гейт живого владельца — в самом SQL, как у строк истории
+        // (chat.service.ts, saveUserMessageRow): access-токен живёт до двух
+        // часов после удаления аккаунта, и строка, записанная в это окно,
+        // пережила бы удаление: chat-upload.purge приходит через 30 дней, а
+        // если на момент удаления загрузок не было, задачи purge нет вовсе.
+        // userId — тот же $1, что и user_id: позиции параметров не меняются.
         const { rows } = await this.pg.query(
           `INSERT INTO chat_uploads
              (user_id, session_id, original_name, mime, size_bytes, sha256, storage_key, source, thumb_key)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+            WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $1 AND u.state = 'active')
            RETURNING ${COLUMNS}`,
           [
             input.userId,
@@ -215,31 +239,37 @@ export class ChatUploadsService {
             thumbKey,
           ],
         );
-        result.saved.push(this.row(rows[0]));
-      } catch (e: any) {
-        // Только вид ошибки (errKind) и обезличенный id объекта: имя файла —
-        // пользовательские данные, а сообщения pg/S3 повторяют его и ключ
-        // объекта. id загрузки здесь ещё нет (строка не записана), ключ сессии
-        // содержит номер телефона; uuid-префикс storage_key (storageKeyLogId)
-        // находит в MinIO объект, если уборка ниже не удалась.
-        // Префикс строки стабилен — по нему грепают журнал.
-        const keyId = this.storageKeyLogId(storageKey);
-        this.logger.warn(`saveOriginals: failed to persist file (key=${keyId}): ${errKind(e)}`);
-        // Best-effort cleanup: оригинал и (если успела лечь) миниатюра —
-        // строки нет, значит и объектов без неё оставлять незачем.
-        for (const key of thumbKey ? [storageKey, thumbKey] : [storageKey]) {
-          try {
-            await this.storage.delete({ bucket: BUCKET, key });
-          } catch (cleanupError: any) {
-            // Сам сбой сохранения уже записан строкой выше; здесь — тоже только вид.
-            this.logger.warn(`saveOriginals: best-effort cleanup delete failed (key=${keyId}): ${errKind(cleanupError)}`);
-          }
+        if (rows[0]) {
+          result.saved.push(this.row(rows[0]));
+          continue;
         }
-        result.failed.push(file.originalname);
+        ownerInactive = true;
+        this.logger.warn(`saveOriginals: owner not active (key=${keyId})`);
+      } catch (e: any) {
+        this.logger.warn(`saveOriginals: failed to persist file (key=${keyId}): ${errKind(e)}`);
       }
+      // Строки нет — значит и объектов без неё оставлять незачем.
+      await this.discardStored(keyId, storageKey, thumbKey);
+      result.failed.push(file.originalname);
     }
 
     return result;
+  }
+
+  /**
+   * Best-effort уборка объектов файла, строка которого не записана: оригинал
+   * и (если успела лечь) миниатюра. Никогда не бросает. Причина — сбой записи
+   * или неактивный владелец — уже записана строкой выше; здесь в журнал тоже
+   * только обезличенный id объекта и вид ошибки.
+   */
+  private async discardStored(keyId: string, storageKey: string, thumbKey: string | null): Promise<void> {
+    for (const key of thumbKey ? [storageKey, thumbKey] : [storageKey]) {
+      try {
+        await this.storage.delete({ bucket: BUCKET, key });
+      } catch (cleanupError: any) {
+        this.logger.warn(`saveOriginals: best-effort cleanup delete failed (key=${keyId}): ${errKind(cleanupError)}`);
+      }
+    }
   }
 
   /**
@@ -576,6 +606,10 @@ export class ChatUploadsService {
    * вышла бы 500. Пустой userId — тоже NotFound без запроса, как в loadOwned.
    * loadOwned здесь не подходит — его отдельный SELECT лишний: владельца
    * проверяет сам UPDATE.
+   * Тот же UPDATE пропускает только живой аккаунт (EXISTS по user_id, как в
+   * saveOriginals): после удаления аккаунта токен ещё живёт, но файл такого
+   * владельца — тот же NotFound, что и несуществующий, без отдельной ветки
+   * и строки журнала: по ответу не узнать, что аккаунт удаляется.
    */
   async setNote(input: {
     id: string;
@@ -593,6 +627,7 @@ export class ChatUploadsService {
       `UPDATE chat_uploads
           SET note = $3, note_updated_at = now(), note_assistant_id = $4
         WHERE id = $1 AND user_id = $2
+          AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $2 AND u.state = 'active')
         RETURNING ${COLUMNS}`,
       [input.id, input.userId, note, input.assistantId ?? null],
     );
