@@ -419,6 +419,21 @@ describe('account deletion worker activation (owner gate D)', () => {
     expect(lock.release).toHaveBeenCalledTimes(1);
   });
 
+  it('строка сводки тика бросила — advisory lock всё равно снят', async () => {
+    const current = account('u-log-throws');
+    await insertDeleted(current);
+    const lock = { release: jest.fn(async () => undefined) };
+    const { coordinator } = compose({}, lock);
+    (Logger.prototype.log as unknown as jest.Mock).mockImplementation((message: any) => {
+      if (String(message).includes(TICK_LINE)) throw new Error('logger down');
+      logLines.push(String(message));
+    });
+
+    await expect(coordinator.tick({ retentionMs: 0 })).rejects.toThrow('logger down');
+
+    expect(lock.release).toHaveBeenCalledTimes(1);
+  });
+
   it('core ждёт stop даже при более раннем next_attempt_at; нулевое число stop не блокирует', async () => {
     const withStop = account('u-dependencies');
     await insertDeleted(withStop);
