@@ -19,6 +19,8 @@ import {
   SyntheticFailures,
   SyntheticGateError,
   SyntheticPreflightError,
+  restoreAccountDeletionWorkerEnv,
+  withAccountDeletionWorkerEnabled,
 } from './account-deletion.synthetic';
 
 /**
@@ -312,5 +314,48 @@ describe('source-guard: CLI и composition root без внешних испол
     expect(source).not.toMatch(/\bdocker\b/i);
     // Никаких платных внешних вызовов: только doubles на границах.
     expect(source).toContain('SyntheticFailures');
+  });
+});
+
+describe('env воркера вокруг синтетического тика — восстановление, а не удаление (ревью Task 25, п.6)', () => {
+  const KEY = 'ACCOUNT_DELETION_WORKER_ENABLED';
+  let saved: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    saved = process.env;
+    process.env = { ...saved };
+  });
+
+  afterEach(() => {
+    process.env = saved;
+  });
+
+  it('прежнее false: внутри true, после — снова false (аварийный выключатель не снят)', async () => {
+    process.env[KEY] = 'false';
+    const inside = await withAccountDeletionWorkerEnabled(async () => process.env[KEY]);
+    expect(inside).toBe('true');
+    expect(process.env[KEY]).toBe('false');
+  });
+
+  it('прежде не задано: после — снова не задано (не пустая строка и не true)', async () => {
+    delete process.env[KEY];
+    await withAccountDeletionWorkerEnabled(async () => undefined);
+    expect(KEY in process.env).toBe(false);
+  });
+
+  it('исключение внутри: значение восстановлено, ошибка проброшена', async () => {
+    process.env[KEY] = ' Off ';
+    await expect(withAccountDeletionWorkerEnabled(async () => {
+      throw new Error('tick failed');
+    })).rejects.toThrow('tick failed');
+    expect(process.env[KEY]).toBe(' Off ');
+  });
+
+  it('restoreAccountDeletionWorkerEnv: undefined — удалить, иначе — присвоить прежнее', () => {
+    process.env[KEY] = 'true';
+    restoreAccountDeletionWorkerEnv(undefined);
+    expect(KEY in process.env).toBe(false);
+    restoreAccountDeletionWorkerEnv('0');
+    expect(process.env[KEY]).toBe('0');
   });
 });
