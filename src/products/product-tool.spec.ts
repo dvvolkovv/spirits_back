@@ -89,9 +89,12 @@ maybe('инструмент продуктов против живого Postgre
     )`);
     // Гард на чужую базу: beforeEach делает TRUNCATE и адрес не разбирает, а на
     // той же ноде живёт база стенда test.linkeon.io с теми же таблицами.
-    const n = await pool.query('SELECT count(*) FROM products');
-    if (Number(n.rows[0].count) > 0) {
-      throw new Error('PROVISIONING_PG_URL указывает на НЕпустую базу — нужна одноразовая');
+    // user_id — тоже: тест ниже пишет в неё строку владельца.
+    const n = await pool.query(
+      'SELECT (SELECT count(*) FROM products) AS products, (SELECT count(*) FROM user_id) AS users',
+    );
+    if (Number(n.rows[0].products) > 0 || Number(n.rows[0].users) > 0) {
+      throw new Error('PROVISIONING_PG_URL указывает на НЕпустую базу (products или user_id) — нужна одноразовая');
     }
   });
 
@@ -467,11 +470,19 @@ maybe('инструмент продуктов против живого Postgre
     // правку пропускает: отказ даёт именно состояние удаления.
     it('владелец удалён (state=deleted) — отказ правки, ход не ставится', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
-      await pool.query(
+      // Строка владельца — только своя: при конфликте не вставляем и падаем с
+      // причиной, а finally удаляет ровно вставленную строку (по deletion_id).
+      const ownDeletionId = randomUUID();
+      const inserted = await pool.query(
         `INSERT INTO user_id (internal_id, state, deleted_at, deletion_id)
-         VALUES ($1, 'deleted', now(), $2)`,
-        [OWNER, randomUUID()],
+         VALUES ($1, 'deleted', now(), $2)
+         ON CONFLICT (internal_id) DO NOTHING
+         RETURNING internal_id`,
+        [OWNER, ownDeletionId],
       );
+      if (inserted.rowCount !== 1) {
+        throw new Error('строка владельца в user_id уже есть (чужая база?) — тест её не трогает');
+      }
       try {
         const svc = new ProductToolService(pg as any, realTurns(), {} as any);
         (svc as any).waitMs = 0;
@@ -482,13 +493,19 @@ maybe('инструмент продуктов против живого Postgre
         const n = await pool.query('SELECT count(*) FROM product_turns');
         expect(Number(n.rows[0].count)).toBe(0);
 
-        await pool.query(`UPDATE user_id SET state = 'active' WHERE internal_id = $1`, [OWNER]);
+        await pool.query(
+          `UPDATE user_id SET state = 'active' WHERE internal_id = $1 AND deletion_id = $2`,
+          [OWNER, ownDeletionId],
+        );
         const ok: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
         expect(ok.turnId).toBeTruthy();
         const m = await pool.query('SELECT count(*) FROM product_turns');
         expect(Number(m.rows[0].count)).toBe(1);
       } finally {
-        await pool.query('DELETE FROM user_id WHERE internal_id = $1', [OWNER]);
+        await pool.query(
+          'DELETE FROM user_id WHERE internal_id = $1 AND deletion_id = $2',
+          [OWNER, ownDeletionId],
+        );
       }
     });
 
