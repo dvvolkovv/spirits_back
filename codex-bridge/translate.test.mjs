@@ -204,3 +204,29 @@ test('схемы инструментов без строковых pattern: Ope
   // исходная схема CLI не мутируется
   assert.equal(schema.properties.to.pattern, '^(?!\\.)(?!.*\\.\\.)[^@]+@[^@]+$');
 });
+
+test('серверный web_search Anthropic (подзапрос WebSearch у CLI) — встроенный web_search upstream с источниками', () => {
+  // 19.11.2026: мост делал из него функцию без параметров, модель «вызывала»
+  // её впустую, и каждый WebSearch у ассистентов на Codex возвращал пустой список.
+  const payload = translateRequest({
+    model: 'gpt-6-astra',
+    messages: [{ role: 'user', content: 'Perform a web search for the query: погода' }],
+    tools: [{ type: 'web_search_20250305', name: 'web_search', allowed_domains: [], blocked_domains: [], max_uses: 8 }],
+    tool_choice: { type: 'tool', name: 'web_search' },
+  });
+  assert.deepEqual(payload.tools, [{ type: 'web_search' }]);
+  assert.deepEqual(payload.include, ['web_search_call.action.sources']);
+});
+
+test('обычные инструменты рядом с web_search остаются функциями, include без поиска не ставится', () => {
+  const tools = toolsToFunctions([
+    { type: 'web_search_20250305', name: 'web_search' },
+    { name: 'Read', input_schema: { type: 'object', properties: {} } },
+  ]);
+  assert.deepEqual(tools, [
+    { type: 'web_search' },
+    { type: 'function', name: 'Read', description: '', parameters: { type: 'object', properties: {} } },
+  ]);
+  const plain = translateRequest({ model: 'gpt-6-astra', messages: [], tools: [{ name: 'Read' }] });
+  assert.equal('include' in plain, false);
+});

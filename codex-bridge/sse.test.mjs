@@ -238,3 +238,71 @@ test('failureCode: null без сбоя, api_error без кода, unknown дл
   weird.stream.handleEvent({ type: 'error', data: { code: 'код с пробелами', message: 'x' } });
   assert.equal(weird.stream.failureCode, 'unknown');
 });
+
+// Так upstream отдаёт поиск (живая проба релея 19.11.2026, include
+// web_search_call.action.sources): готовый item в output_item.done.
+const webSearchDone = (overrides = {}) => ({
+  type: 'response.output_item.done',
+  data: {
+    output_index: 0,
+    item: {
+      type: 'web_search_call',
+      id: 'ws_1',
+      status: 'completed',
+      action: {
+        type: 'search',
+        query: 'погода Горячий Ключ',
+        queries: ['погода Горячий Ключ'],
+        sources: [
+          { type: 'url', url: 'https://meteoinfo.ru/gk' },
+          { type: 'url', url: 'https://pogoda.mail.ru/gk', title: 'Погода Mail' },
+        ],
+      },
+      ...overrides,
+    },
+  },
+});
+
+test('web_search_call → server_tool_use и web_search_tool_result, как серверный поиск Anthropic', () => {
+  const c = collector();
+  const events = [
+    { type: 'response.created', data: { response: {} } },
+    { type: 'response.output_item.added', data: { output_index: 0, item: { type: 'web_search_call', id: 'ws_1', status: 'in_progress' } } },
+    { type: 'response.web_search_call.searching', data: { output_index: 0, item_id: 'ws_1' } },
+    webSearchDone(),
+    { type: 'response.output_item.added', data: { output_index: 1, item: { type: 'message', content: [] } } },
+    { type: 'response.content_part.added', data: { output_index: 1, content_index: 0, part: { type: 'output_text', text: '' } } },
+    { type: 'response.output_text.delta', data: { output_index: 1, delta: 'Завтра +12' } },
+    { type: 'response.output_item.done', data: { output_index: 1, item: { type: 'message' } } },
+    { type: 'response.completed', data: { response: { status: 'completed' } } },
+  ];
+  for (const ev of events) c.stream.handleEvent(ev);
+  const message = assembleMessage(c.rawWrites());
+  assert.deepEqual(message.content, [
+    { type: 'server_tool_use', id: 'srvtoolu_ws_1', name: 'web_search', input: { query: 'погода Горячий Ключ' } },
+    {
+      type: 'web_search_tool_result',
+      tool_use_id: 'srvtoolu_ws_1',
+      content: [
+        { type: 'web_search_result', url: 'https://meteoinfo.ru/gk', title: 'https://meteoinfo.ru/gk' },
+        { type: 'web_search_result', url: 'https://pogoda.mail.ru/gk', title: 'Погода Mail' },
+      ],
+    },
+    { type: 'text', text: 'Завтра +12' },
+  ]);
+  assert.equal(message.stop_reason, 'end_turn');
+});
+
+test('упавший поиск — web_search_tool_result с ошибкой; open_page и прочие шаги чтения — без блоков', () => {
+  const failed = collector();
+  failed.stream.handleEvent(webSearchDone({ status: 'failed', action: undefined }));
+  failed.stream.handleEvent({ type: 'response.completed', data: { response: {} } });
+  const [use, result] = assembleMessage(failed.rawWrites()).content;
+  assert.equal(use.type, 'server_tool_use');
+  assert.deepEqual(result.content, { type: 'web_search_tool_result_error', error_code: 'unavailable' });
+
+  const page = collector();
+  page.stream.handleEvent(webSearchDone({ action: { type: 'open_page', url: 'https://meteoinfo.ru/gk' } }));
+  page.stream.handleEvent({ type: 'response.completed', data: { response: {} } });
+  assert.ok(!page.types().includes('content_block_start'));
+});
