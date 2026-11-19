@@ -95,6 +95,30 @@ export function createAnthropicStream({ model, messageId = `msg_${randomUUID()}`
     blocks.delete(outputIdx);
     emit('content_block_stop', { index });
   }
+  // Поиск upstream приходит готовым item-ом. Отдаём его парой блоков серверного
+  // web_search Anthropic: по ним WebSearch CLI считает поиск и собирает ссылки.
+  // open_page/find — шаги чтения страниц внутри поиска, CLI они не нужны.
+  function emitWebSearch(item, outputIdx) {
+    const action = item.action && typeof item.action === 'object' ? item.action : {};
+    const failed = item.status === 'failed';
+    if (!failed && action.type !== 'search') return;
+    const id = `srvtoolu_${item.id ?? outputIdx}`;
+    const query = typeof action.query === 'string' ? action.query : '';
+    openBlock({ type: 'server_tool_use', id, name: 'web_search', input: {} }, outputIdx);
+    deltaBlock(outputIdx, { type: 'input_json_delta', partial_json: JSON.stringify({ query }) });
+    closeBlock(outputIdx);
+    const content = failed
+      ? { type: 'web_search_tool_result_error', error_code: 'unavailable' }
+      : (Array.isArray(action.sources) ? action.sources : [])
+        .filter((s) => typeof s?.url === 'string')
+        .map((s) => ({
+          type: 'web_search_result',
+          url: s.url,
+          title: typeof s.title === 'string' && s.title ? s.title : s.url,
+        }));
+    openBlock({ type: 'web_search_tool_result', tool_use_id: id, content }, outputIdx);
+    closeBlock(outputIdx);
+  }
   function finish(stopReason) {
     if (finished) return;
     finished = true;
@@ -148,6 +172,7 @@ export function createAnthropicStream({ model, messageId = `msg_${randomUUID()}`
           deltaBlock(data.output_index, { type: 'input_json_delta', partial_json: data.delta ?? '' });
           break;
         case 'response.output_item.done':
+          if (data.item?.type === 'web_search_call') emitWebSearch(data.item, data.output_index);
           closeBlock(data.output_index);
           break;
         case 'response.completed': {

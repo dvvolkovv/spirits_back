@@ -119,11 +119,17 @@ export function stripSchemaPatterns(schema) {
   return out;
 }
 
+// Серверный поиск Anthropic (им WebSearch CLI делает подзапрос) — у upstream это
+// встроенный инструмент, а не функция: функцию без параметров модель «вызывала»
+// впустую, и WebSearch у ассистентов на Codex всегда был пуст (19.11.2026).
+// allowed_domains/blocked_domains не переносим — поиск идёт без фильтра доменов.
+const ANTHROPIC_WEB_SEARCH = /^web_search_\d+$/;
+
 export function toolsToFunctions(tools) {
   if (!Array.isArray(tools)) return [];
   return tools
     .filter((t) => t && typeof t.name === 'string')
-    .map((t) => ({
+    .map((t) => (ANTHROPIC_WEB_SEARCH.test(t.type ?? '') ? { type: 'web_search' } : {
       type: 'function',
       name: t.name,
       description: typeof t.description === 'string' ? t.description : '',
@@ -148,6 +154,8 @@ export function translateRequest(anthropic, {
   if (instructions) payload.instructions = instructions;
   const tools = toolsToFunctions(anthropic.tools);
   if (tools.length) payload.tools = tools;
+  // Без include web_search_call приходит без ссылок — CLI нечего показать.
+  if (tools.some((t) => t.type === 'web_search')) payload.include = ['web_search_call.action.sources'];
   if (typeof anthropic.max_tokens === 'number' && Number.isFinite(anthropic.max_tokens)) {
     payload.max_output_tokens = Math.max(anthropic.max_tokens, MIN_OUTPUT_TOKENS);
   }
