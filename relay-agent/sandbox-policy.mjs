@@ -195,7 +195,8 @@ export function applySandboxPrompt(prompt, sandboxOn) {
     )
     .replace(
       'INSTALL ANYTHING MISSING: apt, pip, npm, wget — whatever it takes.',
-      'INSTALL MISSING PACKAGES: use pip/npm locally in your scratch directory or a venv there; use wget/curl only for allowed domains through the network sandbox. apt and sudo are unavailable.',
+      'INSTALL MISSING PACKAGES: use pip/npm locally in your scratch directory or a venv there; use wget/curl only for allowed domains through the network sandbox. apt and sudo are unavailable.\n'
+        + 'NETWORK FROM BASH: only allow-listed hosts open (package sources such as pypi, npm, GitHub); curl/wget will not open other sites — to open a web page by its link, use mcp__products__open_page if it is in your tool list.',
     )
     .replaceAll('/home/dv/agent-env/bin/activate', `${AGENT_OPT_DIR}/venv/bin/activate`)
     .replaceAll('/home/dv/agent-env/bin/generate_image.sh', `${AGENT_OPT_DIR}/bin/generate_image.sh`);
