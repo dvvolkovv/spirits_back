@@ -288,6 +288,17 @@ test('промпт: on не обещает sudo/apt и использует то
   assert.ok(prompt.endsWith('KEEP THIS TEXT'));
 });
 
+test('промпт on: чужие сайты из Bash не откроются — страница по ссылке через open_page', () => {
+  const line = applySandboxPrompt(PROMPT_PART, true).split('\n').find((l) => l.startsWith('NETWORK FROM BASH:'));
+  assert.ok(line, 'строка о сети Bash есть');
+  assert.match(line, /only allow-listed hosts/);
+  assert.match(line, /curl\/wget will not open other sites/);
+  assert.match(line, /mcp__products__open_page/);
+  // Список доменов живёт в SANDBOX_ALLOWED_DOMAINS, в промпт он не переписывается.
+  for (const domain of EXPECTED_ALLOWED_DOMAINS) assert.equal(line.includes(domain), false, domain);
+  assert.equal(applySandboxPrompt(PROMPT_PART, false).includes('NETWORK FROM BASH'), false);
+});
+
 test('промпт on: DOCX/PDF идёт через WeasyPrint, а не LibreOffice', () => {
   const input = [
     'PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice, Inkscape, poppler-utils',
