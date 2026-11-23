@@ -256,6 +256,29 @@ test("server canary: settings и запреты только у перечисл
   assert.equal(arg(f.calls[1].args, "--disallowedTools").split(",").includes("WebFetch"), false);
 });
 
+// Страница по ссылке (бэклог: «Сайт нельзя открыть по ссылке для анализа»):
+// в песочнице WebFetch запрещён, а curl упирается в белый список доменов.
+// Промпт не обещает WebFetch ни в одном режиме и ведёт к open_page точки
+// продуктов; строку о сети Bash добавляет только песочница.
+for (const mode of ["on", "off"]) {
+  test(`server ${mode}: open_page в белом списке, промпт не обещает WebFetch`, async (t) => {
+    const f = await fixture(t, { mode });
+    const { response } = await f.request({
+      products_token: "test-products-token",
+      products_mcp_url: "https://example.invalid/mcp/products",
+    });
+    assert.equal(response.status, 200);
+    const { args } = f.calls[0];
+    assert.ok(arg(args, "--allowedTools").split(",").includes("mcp__products__open_page"));
+    const prompt = arg(args, "--system-prompt");
+    assert.equal(prompt.includes("WebFetch"), false);
+    assert.ok(prompt.includes("Тебе доступен инструмент mcp__products__open_page"));
+    // Шаблонная строка съедает одиночный обратный слеш — в промпт должен дойти «\.».
+    assert.ok(prompt.includes("strings | grep -iE '\\.(dll|so)'"));
+    assert.equal(prompt.includes("NETWORK FROM BASH"), mode === "on");
+  });
+}
+
 test('server canary: перечисленная upload-сессия получает тот же запрет Agent', async (t) => {
   const f = await fixture(t, {
     mode: 'canary',
