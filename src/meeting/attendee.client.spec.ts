@@ -158,6 +158,23 @@ describe('AttendeeClient', () => {
       expect(JSON.parse(spy.mock.calls[0][1].body).zoom_settings).toEqual({ sdk: 'web' });
     });
 
+    it('для Zoom передаёт веб-адаптер и OBF-токен вместе', async () => {
+      const spy = jest.fn().mockResolvedValue(ok({ id: 'bot_1' }));
+      global.fetch = spy as any;
+
+      await new AttendeeClient().createBot({
+        meetingUrl: 'https://us04web.zoom.us/j/71077562785?pwd=SECRET.1',
+        botName: 'Роман', callId: 'c1', wsUrl: 'wss://my.linkeon.io/attendee/8142?callId=c1',
+        provider: 'zoom',
+        obfToken: 'обф-токен',
+      });
+
+      expect(JSON.parse(spy.mock.calls[0][1].body).zoom_settings).toEqual({
+        sdk: 'web',
+        obf_token: 'обф-токен',
+      });
+    });
+
     it('для Meet настроек Zoom нет вовсе', async () => {
       const spy = jest.fn().mockResolvedValue(ok({ id: 'bot_1' }));
       global.fetch = spy as any;
