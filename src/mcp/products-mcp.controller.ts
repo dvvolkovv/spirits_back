@@ -39,6 +39,8 @@ import { LINKEON_HELP_TOOL_NAME, executeLinkeonHelp, linkeonHelpTool } from '../
 import { ChatService } from '../chat/chat.service';
 import { ProblemReportService } from '../problem-report/problem-report.service';
 import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
+import { OPEN_PAGE_TOOL, OPEN_PAGE_TOOL_NAME } from '../chat/web-page/open-page.tool';
+import { openPage, PageRateLimiter } from '../chat/web-page/open-page';
 
 /**
  * Отдельная точка, а не ветка в точке инструментов linkeon (mcp.controller.ts),
@@ -65,6 +67,11 @@ import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report
 @Controller('/mcp/products')
 export class ProductsMcpController {
   private readonly logger = new Logger(ProductsMcpController.name);
+  /**
+   * Лимит open_page на пользователя — в памяти процесса: контроллер один на
+   * приложение, счётчик общий для всех вызовов точки (и релея, и Маши).
+   */
+  private readonly pageLimiter = new PageRateLimiter();
 
   constructor(
     private readonly tool: ProductToolService,
@@ -102,7 +109,8 @@ export class ProductsMcpController {
    * она: такой получают ходы Telegram-группы с посторонними, где продукты и
    * файлы владельца трогать нельзя, а сообщать в поддержку от их имени — тоже.
    * Поиск файлов — только в вебе (TG-бот в эту фичу не входит); сообщить в
-   * поддержку — в обоих каналах.
+   * поддержку — в обоих каналах. Страница по ссылке (open_page) — только в
+   * вебе: у CLI в Telegram свой WebFetch, а у релея он с 11.11.2026 выключен.
    */
   private toolsFor(c: Pick<ProductToolClaims, 'channel' | 'client' | 'scope'>) {
     const help = linkeonHelpTool(this.clientOf(c));
@@ -113,7 +121,7 @@ export class ProductsMcpController {
     const notes = process.env.CHAT_UPLOADS_ENABLED === 'true' ? [NOTE_FILE_TOOL] : [];
     return c.channel === 'telegram'
       ? [...PRODUCT_TOOLS, REPORT_PROBLEM_TOOL, help]
-      : [...PRODUCT_TOOLS, FIND_FILES_TOOL, ...notes, REPORT_PROBLEM_TOOL, help];
+      : [...PRODUCT_TOOLS, FIND_FILES_TOOL, ...notes, OPEN_PAGE_TOOL, REPORT_PROBLEM_TOOL, help];
   }
 
   /** Вынесено из makeServer ради проверяемости: контракт схемы — часть защиты. */
@@ -172,6 +180,15 @@ export class ProductsMcpController {
       // Статистика админки, как у find_files: канал из подписи и исход — без id
       // файла и текста комментария.
       this.events?.track('note_file_call', { userId, props: { channel, ok: result.ok } });
+      return result;
+    }
+    if (name === OPEN_PAGE_TOOL_NAME) {
+      // Пользователь — из подписи (по нему лимит частоты), язык — тоже из
+      // подписи, без похода в профиль: он нужен лишь для Accept-Language.
+      const { kind, result } = await openPage(userId, input, { limiter: this.pageLimiter, lang: claims.lang });
+      // Статистика: канал, исход и вид (html/text/… или причина отказа). Адреса,
+      // хоста и текста страницы здесь нет — это переписка пользователя.
+      this.events?.track('open_page_call', { userId, props: { channel, ok: result.ok, kind } });
       return result;
     }
     if (name === REPORT_PROBLEM_TOOL_NAME) {

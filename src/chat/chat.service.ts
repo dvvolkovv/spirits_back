@@ -41,7 +41,7 @@ import { afterReset } from './context-reset/after-reset';
 import { ChatContextResetService } from './context-reset/context-reset.service';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
-import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME, OPEN_PAGE_CLI_PROMPT, OPEN_PAGE_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
@@ -1819,7 +1819,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // system у CLI нет — см. uploadContextBlock) и до хвоста языка,
           // который обязан остаться последней строкой.
           system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
-            (uploadNotesOn ? `\n\n${NOTE_FILE_CLI_PROMPT}` : '') +
+            (uploadNotesOn ? `\n\n${NOTE_FILE_CLI_PROMPT}` : '') + `\n\n${OPEN_PAGE_CLI_PROMPT}` +
             (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt +
             (mashaUploadContext ? `\n\n${mashaUploadContext}` : '') + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
@@ -1846,7 +1846,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // + справка о Linkeon (platform-kb).
           // + комментарий к загрузке (note-file.tool.ts) — только при флаге
           // CHAT_UPLOADS_ENABLED, как и на самой точке.
-          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME}${uploadNotesOn ? `,${NOTE_FILE_CLI_TOOL_NAME}` : ''},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
+          // + страница по ссылке (chat/web-page/open-page.tool.ts): скачивает
+          // бэкенд через safeGet, у самой Маши сети по-прежнему нет.
+          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME}${uploadNotesOn ? `,${NOTE_FILE_CLI_TOOL_NAME}` : ''},${OPEN_PAGE_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
@@ -1854,7 +1856,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             // поддержку: «карточка», «картинка» о найденных файлах, «не проходит
             // оплата картой» в жалобе — не повод вешать метафорическую карту;
             // и к ходу со справкой: вопрос о платформе — не повод для метафорической карты.
-            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === NOTE_FILE_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
+            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === NOTE_FILE_CLI_TOOL_NAME || ev.name === OPEN_PAGE_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
             // не отдаёт — хватает имени: у Маши только инструменты точки продуктов.
             // Для новых инструментов понадобится input — onProgress его не отдаёт.

@@ -182,6 +182,10 @@ export function toActivity(tool: unknown, rawInput: unknown, who: ActivityOwner)
     case 'WebSearch':
       return ev('web_search', cleanDetail(inputField(rawInput, 'query'), who.userId));
     case 'WebFetch':
+    // Страница по ссылке с точки продуктов (chat/web-page/open-page.tool.ts):
+    // то же действие и тот же код шага, что у WebFetch, — подпись «Читаю
+    // страницу» у фронта и Flutter уже есть.
+    case 'mcp__products__open_page':
       return ev('web_fetch', cleanDetail(hostOf(inputField(rawInput, 'url')), who.userId));
     case 'Read': {
       const p = inputField(rawInput, 'file_path');

@@ -16,6 +16,18 @@ describe('toActivity — что видит человек вместо трёх 
       .toEqual({ type: 'activity', kind: 'web_fetch', detail: 'avito.ru' });
   });
 
+  // open_page (точка продуктов) — то же действие, что WebFetch, и тот же код
+  // шага: фронт и Flutter уже подписывают web_fetch («Читаю страницу»).
+  it('страница по ссылке через open_page — как WebFetch: только хост', () => {
+    expect(toActivity('mcp__products__open_page', json({ url: 'https://www.avito.ru/kazan?id=1&token=abc', max_chars: 5000 }), WHO))
+      .toEqual({ type: 'activity', kind: 'web_fetch', detail: 'avito.ru' });
+    expect(toActivity('mcp__products__open_page', json({ url: 'http://10.0.0.5:8080/admin' }), WHO))
+      .toEqual({ type: 'activity', kind: 'web_fetch' });
+    // У Маши onProgress аргументов не отдаёт — шаг без уточнения.
+    expect(toActivity('mcp__products__open_page', '', { userId: 'u-test' }))
+      .toEqual({ type: 'activity', kind: 'web_fetch' });
+  });
+
   it('input, обрезанный релеем до 300 символов, всё равно даёт закрытое поле', () => {
     const cut = json({ file_path: `/tmp/agent-output/${PHONE}_12_ru/Отчёт.pdf`, content: 'x'.repeat(500) }).slice(0, 300);
     expect(() => JSON.parse(cut)).toThrow();

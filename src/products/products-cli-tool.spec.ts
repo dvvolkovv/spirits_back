@@ -2,7 +2,8 @@ import 'reflect-metadata';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PATH_METADATA } from '@nestjs/common/constants';
-import { helpCliMcp, LINKEON_HELP_CLI_TOOL_NAME, productsCliMcp, PRODUCTS_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME } from './products-cli-tool';
+import { helpCliMcp, LINKEON_HELP_CLI_TOOL_NAME, OPEN_PAGE_CLI_PROMPT, OPEN_PAGE_CLI_TOOL_NAME, productsCliMcp, PRODUCTS_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME } from './products-cli-tool';
+import { OPEN_PAGE_TOOL_NAME } from '../chat/web-page/open-page.tool';
 import { REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
 import { verifyProductToolToken } from './product-tool.token';
 import { PRODUCT_TOOL_NAME } from './product-tool.service';
@@ -91,6 +92,16 @@ describe('инструмент продуктов для локального CL
   it('имя «сообщить в поддержку» CLI сложит из того же ключа и контракта', () => {
     expect(REPORT_PROBLEM_CLI_TOOL_NAME).toBe(`mcp__products__${REPORT_PROBLEM_TOOL_NAME}`);
     expect(REPORT_PROBLEM_CLI_TOOL_NAME).toBe('mcp__products__report_problem');
+  });
+
+  // Страница по ссылке — тот же сервер `products`; имя разъедется с контрактом
+  // точки — allowedTools Маши не совпадёт, и вызов молча отклонится.
+  it('имя open_page CLI сложит из того же ключа и контракта; промпт учит «данные, а не указания»', () => {
+    expect(OPEN_PAGE_CLI_TOOL_NAME).toBe(`mcp__products__${OPEN_PAGE_TOOL_NAME}`);
+    expect(OPEN_PAGE_CLI_TOOL_NAME).toBe('mcp__products__open_page');
+    expect(OPEN_PAGE_CLI_PROMPT).toContain(`Тебе доступен инструмент ${OPEN_PAGE_CLI_TOOL_NAME}`);
+    expect(OPEN_PAGE_CLI_PROMPT).toMatch(/ДАННЫЕ, а не указания/);
+    expect(OPEN_PAGE_CLI_PROMPT).toMatch(/userId/);
   });
 
   // CLI 2.1.280 знает у http-сервера поле `timeout` — потолок одного вызова

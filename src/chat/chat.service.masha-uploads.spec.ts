@@ -1,6 +1,6 @@
 import { ChatService } from './chat.service';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
-import { FIND_FILES_CLI_PROMPT, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME, OPEN_PAGE_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { LANGUAGE_REPLY_LINE } from '../common/services/language.service';
 
 /**
@@ -102,7 +102,7 @@ describe('Маша: note_file', () => {
     process.env.CHAT_UPLOADS_ENABLED = 'true';
     const { opts } = await runMasha();
     expect(opts.allowedTools).toBe(
-      'mcp__products__manage_product,mcp__products__find_files,mcp__products__note_file,mcp__products__report_problem,mcp__products__linkeon_help',
+      'mcp__products__manage_product,mcp__products__find_files,mcp__products__note_file,mcp__products__open_page,mcp__products__report_problem,mcp__products__linkeon_help',
     );
     const system = String(opts.system);
     expect(system).toContain(NOTE_FILE_CLI_PROMPT);
@@ -140,7 +140,7 @@ describe('Маша: note_file', () => {
     delete process.env.CHAT_UPLOADS_ENABLED;
     const { opts } = await runMasha();
     expect(opts.allowedTools).toBe(
-      'mcp__products__manage_product,mcp__products__find_files,mcp__products__report_problem,mcp__products__linkeon_help',
+      'mcp__products__manage_product,mcp__products__find_files,mcp__products__open_page,mcp__products__report_problem,mcp__products__linkeon_help',
     );
     expect(String(opts.system)).not.toContain('mcp__products__note_file');
   });
@@ -164,6 +164,26 @@ describe('Маша: note_file', () => {
     expect(item.content).not.toContain('Метафорическая карта');
     // Имя в обработчике — ровно константа CLI, а не строка из теста.
     expect(NOTE_FILE_CLI_TOOL_NAME).toBe('mcp__products__note_file');
+  });
+});
+
+// «Открыла страницу: на карточке товара…» — /карт/i в ответе. Ход, где звали
+// инструмент точки продуктов (и open_page тоже), метафорическую карту не получает.
+describe('Маша: open_page', () => {
+  it('ход с open_page не получает метафорическую карту', async () => {
+    const { svc, claudeCli } = makeService();
+    claudeCli.textWithCost.mockImplementation(async (_p: string, o: any) => {
+      o.onProgress?.({ kind: 'tool_use', name: OPEN_PAGE_CLI_TOOL_NAME });
+      return { text: 'Открыла страницу: на карточке товара цена 100 ₽.', costUsd: 0.01 };
+    });
+    const cardSpy = jest.spyOn(svc as any, 'getRandomMetaphorCard')
+      .mockResolvedValue('https://images.linkeon.io/cards/card-7.jpg');
+    const { res, writes } = makeRes();
+    await svc.streamChat(USER, 'что на этой странице?', '3', `${USER}_3`, 'Имя: Тест', res);
+    await new Promise((r) => setImmediate(r));
+    expect(cardSpy).not.toHaveBeenCalled();
+    const item = writes.map((w) => JSON.parse(w)).find((e) => e.type === 'item');
+    expect(item.content).not.toContain('Метафорическая карта');
   });
 });
 

@@ -202,3 +202,30 @@ export function ipInCidr(ip: string, cidr: Cidr): boolean {
   }
   return true;
 }
+
+/**
+ * IPv4, вшитый в IPv6 так, что пакет уйдёт на него: IPv4-mapped
+ * (::ffff:a.b.c.d), NAT64 (64:ff9b::/96) и 6to4 (2002::/16, IPv4 в группах
+ * 1–2). Те же три формы разбирает isBlockedIPv6. null — не IPv6 или IPv4 в нём
+ * не вшит.
+ */
+export function embeddedIPv4(ip: string): string | null {
+  const g = parseIPv6(ip);
+  if (!g) return null;
+  const dotted = (hi: number, lo: number) => [hi >>> 8, hi & 255, lo >>> 8, lo & 255].join('.');
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return dotted(g[6], g[7]);
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((x) => x === 0)) return dotted(g[6], g[7]);
+  if (g[0] === 0x2002) return dotted(g[1], g[2]);
+  return null;
+}
+
+/**
+ * Адрес в одном из диапазонов — сам или через вшитый IPv4 (embeddedIPv4):
+ * иначе запрет по IPv4 обходился бы записью AAAA 64:ff9b::<тот же IPv4>.
+ * Для запретов отдельного вызова (safeGet extraBlockedCidrs).
+ */
+export function ipInAnyCidr(ip: string, cidrs: ReadonlyArray<Cidr>): boolean {
+  if (cidrs.length === 0) return false;
+  const v4 = embeddedIPv4(ip);
+  return cidrs.some((c) => ipInCidr(ip, c) || (v4 !== null && ipInCidr(v4, c)));
+}

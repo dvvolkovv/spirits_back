@@ -59,7 +59,7 @@ describe('note_file на точке /webhook/mcp/products', () => {
     it('веб, флаг включён: note_file сразу после find_files, без userId в схеме', () => {
       const { ctrl } = make();
       const tools = ctrl.listTools('web') as any[];
-      expect(tools.map((t) => t.name)).toEqual(['manage_product', 'find_files', 'note_file', 'report_problem', 'linkeon_help']);
+      expect(tools.map((t) => t.name)).toEqual(['manage_product', 'find_files', 'note_file', 'open_page', 'report_problem', 'linkeon_help']);
       const note = tools.find((t) => t.name === 'note_file');
       expect(Object.keys(note.inputSchema.properties)).not.toContain('userId');
     });
@@ -67,7 +67,7 @@ describe('note_file на точке /webhook/mcp/products', () => {
     it('веб, флаг выключен: note_file нет — набор прежний', () => {
       delete process.env.CHAT_UPLOADS_ENABLED;
       const { ctrl } = make();
-      expect(ctrl.listTools('web').map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'report_problem', 'linkeon_help']);
+      expect(ctrl.listTools('web').map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'open_page', 'report_problem', 'linkeon_help']);
     });
 
     it('Telegram и область help: note_file нет (бот — очередь 2)', () => {
