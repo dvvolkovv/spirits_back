@@ -46,7 +46,7 @@ import * as net from 'net';
 import * as os from 'os';
 import { Readable, Transform, pipeline } from 'stream';
 import axios from 'axios';
-import { canonicalIp, ipInCidr, isBlockedAddress, parseCidr, Cidr } from './ip-policy';
+import { canonicalIp, ipInAnyCidr, ipInCidr, isBlockedAddress, parseCidr, Cidr } from './ip-policy';
 
 export interface UrlPolicy {
   /** Разрешить http:// (по умолчанию только https). */
@@ -55,6 +55,19 @@ export interface UrlPolicy {
   allowAnyPort?: boolean;
   /** Разрешить логин:пароль в самой ссылке (по умолчанию нельзя). */
   allowCredentials?: boolean;
+  /**
+   * Запреты ЭТОГО вызова сверх общих правил и SSRF_EXTRA_BLOCKED_CIDRS: CIDR
+   * вида `a.b.c.d/nn` или `x:y::/nn`, без длины — один адрес. Проверяются там
+   * же, где общие правила: IP-литерал ссылки и все адреса DNS — на каждом шаге,
+   * включая редиректы. Адрес совпадает и через вшитый IPv4 (mapped, NAT64,
+   * 6to4 — ip-policy, ipInAnyCidr). Неразобранная запись — ошибка, а не молча
+   * пустой запрет.
+   *
+   * Свой MinIO (ownStorageRoute) читается в обход DNS и этого списка: адрес
+   * туда берётся из окружения, а не из ссылки, и чтение анонимное — то же, что
+   * видит любой человек в интернете.
+   */
+  extraBlockedCidrs?: ReadonlyArray<string>;
 }
 
 export interface ResolvedAddress {
@@ -167,6 +180,30 @@ export function __setSafeFetchDepsForTests(d: Partial<SafeFetchDeps> | null): vo
 
 // ───────────────────────── проверка ссылки ─────────────────────────
 
+const policyCidrCache = new Map<string, Cidr[]>();
+
+function policyCidrs(policy: UrlPolicy): Cidr[] {
+  const raw = policy.extraBlockedCidrs;
+  if (!raw || raw.length === 0) return [];
+  const key = raw.join(',');
+  const cached = policyCidrCache.get(key);
+  if (cached) return cached;
+  const list = raw.map((s) => {
+    const c = parseCidr(s);
+    // Ошибка вызывающего, а не ссылки: без неё запрет молча стал бы пустым.
+    if (!c) throw new Error(`extraBlockedCidrs: не разобран CIDR «${s}»`);
+    return c;
+  });
+  if (policyCidrCache.size > 64) policyCidrCache.clear();
+  policyCidrCache.set(key, list);
+  return list;
+}
+
+/** Общие правила (deps.isBlocked) плюс запреты этого вызова. */
+function isBlockedFor(ip: string, policy: UrlPolicy): boolean {
+  return deps.isBlocked(ip) || ipInAnyCidr(ip, policyCidrs(policy));
+}
+
 /** Имя хоста для сравнений: нижний регистр, без [скобок] IPv6 и без завершающей точки. */
 export function normalizeHostname(host: string): string {
   let h = String(host ?? '').trim().toLowerCase();
@@ -199,7 +236,7 @@ export function checkUrlSyntax(raw: string, policy: UrlPolicy = {}): URL {
   const host = normalizeHostname(u.hostname);
   if (!host) throw new UnsafeUrlError('некорректный адрес');
   if (net.isIP(host)) {
-    if (deps.isBlocked(host)) throw new UnsafeUrlError(REASON_INTERNAL);
+    if (isBlockedFor(host, policy)) throw new UnsafeUrlError(REASON_INTERNAL);
   } else if (isForbiddenName(host)) {
     throw new UnsafeUrlError(REASON_INTERNAL);
   }
@@ -242,7 +279,7 @@ export async function assertPublicUrl(raw: string, policy: UrlPolicy = {}): Prom
     clearTimeout(timer);
   }
   if (!addresses || addresses.length === 0) throw dnsError(hostname);
-  if (addresses.some((a) => deps.isBlocked(a.address))) throw new UnsafeUrlError(REASON_INTERNAL);
+  if (addresses.some((a) => isBlockedFor(a.address, policy))) throw new UnsafeUrlError(REASON_INTERNAL);
   return { url, hostname, addresses };
 }
 
@@ -480,7 +517,12 @@ export async function safeGet(url: string, opts: SafeGetOptions): Promise<SafeRe
   let timerOwnedByStream = false;
   const maxRedirects = opts.maxRedirects ?? SAFE_FETCH_DEFAULT_MAX_REDIRECTS;
   const okStatus = opts.validateStatus ?? ((s: number) => s >= 200 && s < 300);
-  const policy: UrlPolicy = { allowHttp: opts.allowHttp, allowAnyPort: opts.allowAnyPort, allowCredentials: opts.allowCredentials };
+  const policy: UrlPolicy = {
+    allowHttp: opts.allowHttp,
+    allowAnyPort: opts.allowAnyPort,
+    allowCredentials: opts.allowCredentials,
+    extraBlockedCidrs: opts.extraBlockedCidrs,
+  };
 
   try {
     let current = url;
