@@ -71,7 +71,8 @@ test("правило 3: проверка по тому, как результа�
     "never show «sent» unless the response confirms it",
     "change only what was asked",
     "neighbouring buttons, the header, the mobile layout",
-    "what was verified and what could not be verified",
+    // Итоговая строка — только при выдаче результата, а не в каждом ответе.
+    "Handing over any of these, end the reply with one line: what was verified and what could not be verified",
     "Never say «works» without running it",
   ]) assert.ok(r.includes(phrase), phrase);
 });
