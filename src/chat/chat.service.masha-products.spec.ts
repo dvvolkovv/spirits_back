@@ -1,6 +1,6 @@
 import { ChatService } from './chat.service';
 import { verifyProductToolToken } from '../products/product-tool.token';
-import { FIND_FILES_CLI_PROMPT, LINKEON_HELP_CLI_TOOL_NAME, PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, LINKEON_HELP_CLI_TOOL_NAME, OPEN_PAGE_CLI_PROMPT, PRODUCTS_CLI_PROMPT } from '../products/products-cli-tool';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { LANGUAGE_REPLY_LINE } from '../common/services/language.service';
 import { platformGuide } from './platform-guide';
@@ -119,9 +119,9 @@ describe('Маша в вебе: инструмент продуктов', () => 
     });
   });
 
-  it('автоодобрены ровно продукты, поиск файлов, сообщение в поддержку и справка; встроенные тулы не включаются', async () => {
+  it('автоодобрены ровно продукты, поиск файлов, страница по ссылке, сообщение в поддержку и справка; встроенные тулы не включаются', async () => {
     const { opts } = await runMasha();
-    expect(opts.allowedTools).toBe('mcp__products__manage_product,mcp__products__find_files,mcp__products__report_problem,mcp__products__linkeon_help');
+    expect(opts.allowedTools).toBe('mcp__products__manage_product,mcp__products__find_files,mcp__products__open_page,mcp__products__report_problem,mcp__products__linkeon_help');
     // tools не задан — сервис оставит `--tools ""`: у Маши нет ни Read, ни Bash.
     expect(opts.tools === undefined || opts.tools === '').toBe(true);
   });
@@ -131,6 +131,7 @@ describe('Маша в вебе: инструмент продуктов', () => 
     const system = String(opts.system);
     expect(system).toContain(PRODUCTS_CLI_PROMPT);
     expect(system).toContain(FIND_FILES_CLI_PROMPT);
+    expect(system).toContain(OPEN_PAGE_CLI_PROMPT);
     // Правило справки и инициатива — теперь часть самой карты (platformGuide),
     // переданной Маше напрямую с helpTool+initiative, без отдельного блока.
     expect(system).toContain(platformGuide('ru', { store: false, helpTool: LINKEON_HELP_CLI_TOOL_NAME, initiative: true }));
