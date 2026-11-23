@@ -1,4 +1,4 @@
-import { canonicalIp, ipInCidr, isBlockedAddress, parseCidr, parseIPv4, parseIPv6 } from './ip-policy';
+import { canonicalIp, embeddedIPv4, ipInAnyCidr, ipInCidr, isBlockedAddress, parseCidr, parseIPv4, parseIPv6 } from './ip-policy';
 
 /**
  * Классификация адресов для защиты от SSRF. Каждый диапазон проверяется с
@@ -133,5 +133,38 @@ describe('ip-policy: мусор и канонизация', () => {
 
     expect(parseCidr('10.0.0.0/33')).toBeNull();
     expect(parseCidr('bogus/8')).toBeNull();
+  });
+});
+
+/**
+ * Запреты отдельного вызова (safeGet extraBlockedCidrs): наши публичные серверы.
+ * Адрес сверяется и сам, и через IPv4, вшитый в IPv6 так, что пакет уйдёт на
+ * него, — иначе имя с AAAA 64:ff9b::<наш IPv4> обошло бы запрет по IPv4.
+ */
+describe('ip-policy: вшитый IPv4 и запреты по списку CIDR', () => {
+  it.each([
+    ['::ffff:5.101.115.184', '5.101.115.184'],
+    ['::ffff:565:73b8', '5.101.115.184'],
+    ['64:ff9b::5.101.115.184', '5.101.115.184'],
+    ['64:ff9b::565:73b8', '5.101.115.184'],
+    ['2002:565:73b8::1', '5.101.115.184'],
+    ['[2002:565:73b8:1::1]', '5.101.115.184'],
+  ])('%s несёт %s', (ip, v4) => {
+    expect(embeddedIPv4(ip)).toBe(v4);
+  });
+
+  it.each(['5.101.115.184', '2a01:4f8::1', '64:ff9b:1::565:73b8', '2003:565:73b8::1', 'nope', ''])('%j — вшитого IPv4 нет', (ip) => {
+    expect(embeddedIPv4(ip)).toBeNull();
+  });
+
+  it('ipInAnyCidr: сам адрес, mapped, NAT64 и 6to4 — в списке; соседи — нет', () => {
+    const list = [parseCidr('5.101.115.184/32')!, parseCidr('2a01:4f8::/32')!];
+    for (const ip of ['5.101.115.184', '::ffff:5.101.115.184', '64:ff9b::565:73b8', '2002:565:73b8::1', '2a01:4f8:1::1']) {
+      expect(ipInAnyCidr(ip, list)).toBe(true);
+    }
+    for (const ip of ['5.101.115.185', '64:ff9b::565:73b9', '2002:565:73b9::1', '2a01:4f9::1', '8.8.8.8']) {
+      expect(ipInAnyCidr(ip, list)).toBe(false);
+    }
+    expect(ipInAnyCidr('5.101.115.184', [])).toBe(false);
   });
 });

@@ -548,3 +548,80 @@ describe('своё хранилище: MINIO_PUBLIC_URL → внутренний
     expect(srv.hits).toHaveLength(0);
   });
 });
+
+/**
+ * Запреты ОДНОГО вызова (extraBlockedCidrs) — сверх общих правил и
+ * SSRF_EXTRA_BLOCKED_CIDRS. Нужны вызывающему, которому закрыты и публичные
+ * адреса: open_page не ходит на наши же серверы. Остальные вызывающие опцию не
+ * передают, и для них ничего не меняется — это сторожат кейсы «без опции».
+ */
+describe('extraBlockedCidrs — запреты одного вызова', () => {
+  const OURS = ['5.101.115.184/32', '92.53.64.147/32'];
+
+  it('IP-литерал из списка — отказ; без опции тот же адрес проходит', () => {
+    expect(() => checkUrlSyntax('https://5.101.115.184/', { extraBlockedCidrs: OURS })).toThrow(UnsafeUrlError);
+    expect(() => checkUrlSyntax('https://[::ffff:5.101.115.184]/', { extraBlockedCidrs: OURS })).toThrow(UnsafeUrlError);
+    expect(() => checkUrlSyntax('https://[64:ff9b::565:73b8]/', { extraBlockedCidrs: OURS })).toThrow(UnsafeUrlError);
+    expect(checkUrlSyntax('https://5.101.115.184/').hostname).toBe('5.101.115.184');
+    expect(checkUrlSyntax('https://5.101.115.185/', { extraBlockedCidrs: OURS }).hostname).toBe('5.101.115.185');
+  });
+
+  it('имя, которое резолвится в адрес из списка, — отказ; сообщение без адреса', async () => {
+    __setSafeFetchDepsForTests({
+      resolve: fakeResolver({ 'relay.example': ['5.101.115.184'], 'proxy.example': ['8.8.8.8', '92.53.64.147'], 'ok.example': ['8.8.8.8'] }).resolve,
+    });
+    const err = await assertPublicUrl('https://relay.example/', { extraBlockedCidrs: OURS }).catch((e) => e);
+    expect(err).toBeInstanceOf(UnsafeUrlError);
+    expect(err.message).not.toMatch(/5\.101|92\.53/);
+    // хоть один адрес из списка — отказ, как и с общими правилами
+    await expect(assertPublicUrl('https://proxy.example/', { extraBlockedCidrs: OURS })).rejects.toThrow(UnsafeUrlError);
+    await expect(assertPublicUrl('https://ok.example/', { extraBlockedCidrs: OURS })).resolves.toBeTruthy();
+    // без опции — прежнее поведение
+    await expect(assertPublicUrl('https://relay.example/')).resolves.toBeTruthy();
+  });
+
+  it('неразобранный CIDR в опции — ошибка, а не молча пустой запрет', () => {
+    expect(() => checkUrlSyntax('https://8.8.8.8/', { extraBlockedCidrs: ['5.101.115.184/40'] })).toThrow(/CIDR/);
+  });
+
+  describe('safeGet: проверка на каждом шаге, включая редиректы', () => {
+    let srv: TestServer;
+    afterEach(async () => { await srv?.close(); });
+
+    // 127.0.0.1 — «интернет» (тут живёт тестовый сервер), 127.0.0.2 — «наш
+    // сервер»: публичный для общих правил, закрытый только опцией. Если
+    // проверка шага сломана, запрос уйдёт на 127.0.0.2, где никто не слушает, —
+    // наружу из машины ничего не выходит.
+    function useDns() {
+      __setSafeFetchDepsForTests({
+        isBlocked: (ip: string) => ip !== '127.0.0.1' && ip !== '127.0.0.2' && isBlockedAddress(ip),
+        resolve: fakeResolver({ 'public.test': ['127.0.0.1'], 'ours.test': ['127.0.0.2'] }).resolve,
+      });
+    }
+    const opts = (extra?: string[]) => ({
+      allowHttp: true, allowAnyPort: true, maxBytes: 100, timeoutMs: 2000, ...(extra ? { extraBlockedCidrs: extra } : {}),
+    });
+
+    it('первый шаг на адрес из списка — отказ до соединения', async () => {
+      srv = await startServer((req, res) => res.end('x'));
+      useDns();
+      const err = await safeGet(`http://public.test:${srv.port}/`, opts(['127.0.0.1/32'])).catch((e) => e);
+      expect(err).toBeInstanceOf(UnsafeUrlError);
+      expect(srv.hits).toHaveLength(0);
+    });
+
+    it('редирект на имя с адресом из списка — отказ безопасности; без опции — обычная сетевая ошибка', async () => {
+      srv = await startServer((req, res) => {
+        if (req.url === '/start') { res.statusCode = 302; res.setHeader('Location', `http://ours.test:${srv.port}/secret`); return res.end(); }
+        res.end('SECRET');
+      });
+      useDns();
+      const blocked = await safeGet(`http://public.test:${srv.port}/start`, opts(['127.0.0.2/32'])).catch((e) => e);
+      expect(blocked).toBeInstanceOf(UnsafeUrlError);
+      expect(srv.hits.map((h) => h.url)).toEqual(['/start']);
+
+      const plain = await safeGet(`http://public.test:${srv.port}/start`, opts()).catch((e) => e);
+      expect(isUnsafeUrlError(plain)).toBe(false);
+    });
+  });
+});
