@@ -125,14 +125,14 @@ describe('точка /mcp/products', () => {
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
-  it('веб: продукты, поиск файлов, сообщение в поддержку и справка; ни у одного нет аргумента userId', () => {
+  it('веб: продукты, поиск файлов, страница по ссылке, сообщение в поддержку и справка; ни у одного нет аргумента userId', () => {
     const { ctrl } = make();
     const tools = ctrl.listTools('web');
-    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'report_problem', 'linkeon_help']);
+    expect(tools.map((t: any) => t.name)).toEqual(['manage_product', 'find_files', 'open_page', 'report_problem', 'linkeon_help']);
     for (const t of tools as any[]) expect(Object.keys(t.inputSchema.properties)).not.toContain('userId');
   });
 
-  it('Telegram: продукты, сообщение в поддержку и справка — поиск файлов в боте не включён', () => {
+  it('Telegram: продукты, сообщение в поддержку и справка — поиск файлов и open_page в боте не включены', () => {
     const { ctrl } = make();
     expect(ctrl.listTools('telegram').map((t: any) => t.name)).toEqual(['manage_product', 'report_problem', 'linkeon_help']);
   });
